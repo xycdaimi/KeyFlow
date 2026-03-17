@@ -1,0 +1,22 @@
+services:
+  keyflow:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - ../.env
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  keyflow-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["python", "workers/health_check_worker.py"]
+    env_file:
+      - ../.env
