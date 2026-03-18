@@ -18,3 +18,87 @@ pip install -e .[dev]
 uvicorn main:app --reload --app-dir src
 pytest
 ```
+
+## Docker 本地联调（拆分 Compose）
+
+1) 准备环境变量：
+
+```bash
+cp .env.example .env
+```
+
+`docker/src/docker-compose.yml` 只使用根 `.env` 中的原始变量名；
+启动脚本会通过 `--env-file .env` 显式传入。
+
+2) 启动基础依赖：
+
+```bash
+docker compose -f docker/postgresql/docker-compose.yml up -d
+docker compose -f docker/redis/docker-compose.yml up -d
+```
+
+3) 启动应用容器：
+
+```bash
+docker compose --env-file .env -f docker/src/docker-compose.yml up -d --build
+```
+
+4) 启动时自动检查并创建缺失表（已存在表不会重复创建）。
+
+5) 检查服务健康：
+
+```bash
+curl http://localhost:8000/health
+docker compose -f docker/src/docker-compose.yml ps
+```
+
+6) 关闭：
+
+```bash
+docker compose -f docker/src/docker-compose.yml down
+docker compose -f docker/redis/docker-compose.yml down
+docker compose -f docker/postgresql/docker-compose.yml down
+```
+
+## scripts 便捷命令（按组件）
+
+```bash
+./scripts/start_postgre.sh
+./scripts/start_redis.sh
+./scripts/start_src.sh
+```
+
+停止：
+
+```bash
+./scripts/stop_src.sh
+./scripts/stop_redis.sh
+./scripts/stop_postgre.sh
+```
+
+Windows（cmd/powershell）：
+
+```bat
+scripts\start_postgre.bat
+scripts\start_redis.bat
+scripts\start_src.bat
+scripts\stop_src.bat
+scripts\stop_redis.bat
+scripts\stop_postgre.bat
+```
+
+可选参数：
+
+```bash
+./scripts/start_src.sh --no-build
+./scripts/stop_src.sh --volumes
+./scripts/stop_redis.sh --volumes
+./scripts/stop_postgre.sh --volumes
+```
+
+```bat
+scripts\start_src.bat --no-build
+scripts\stop_src.bat --volumes
+scripts\stop_redis.bat --volumes
+scripts\stop_postgre.bat --volumes
+```

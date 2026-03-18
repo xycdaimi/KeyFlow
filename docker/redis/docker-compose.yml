@@ -1,0 +1,24 @@
+name: keyflow
+
+services:
+  keyflow-redis:
+    container_name: keyflow-redis
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - keyflow-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - keyflow-network
+
+volumes:
+  keyflow-redis-data:
+
+networks:
+  keyflow-network:
+    driver: bridge

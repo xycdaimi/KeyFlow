@@ -39,6 +39,7 @@ class InMemoryKeyRepository:
 class InMemoryAllocationStore:
     def __init__(self) -> None:
         self.synced_scores: dict[str, float] = {}
+        self.released: list[tuple[str, str]] = []
 
     async def sync_key(self, key: ApiKey, score: float) -> None:
         self.synced_scores[key.id] = score
@@ -46,10 +47,19 @@ class InMemoryAllocationStore:
     async def remove_key(self, key_id: str, provider: str) -> None:
         self.synced_scores.pop(key_id, None)
 
-    async def allocate_key(self, provider: str, ordered_key_ids: list[str], now: datetime) -> str | None:
+    async def allocate_key(
+        self,
+        provider: str,
+        ordered_key_ids: list[str],
+        now: datetime,
+        lease_seconds: int = 2,
+    ) -> str | None:
         if not ordered_key_ids:
             return None
         return ordered_key_ids[0]
+
+    async def release_key_lease(self, provider: str, key_id: str) -> None:
+        self.released.append((provider, key_id))
 
 
 class FakeProviderPlugin(ProviderPlugin):
@@ -69,6 +79,7 @@ class FakeProviderPlugin(ProviderPlugin):
         self._available = available
         self.success_calls: list[tuple[str, dict]] = []
         self.error_calls: list[tuple[str, dict]] = []
+        self.available_checks: list[tuple[str, str | None]] = []
 
     @property
     def name(self) -> str:
@@ -78,6 +89,7 @@ class FakeProviderPlugin(ProviderPlugin):
         return self._models
 
     async def is_credential_available(self, api_key: str, model: str | None = None) -> bool:
+        self.available_checks.append((api_key, model))
         return self._available
 
     async def mark_success(self, api_key: str, meta: dict | None = None) -> None:

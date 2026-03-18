@@ -13,7 +13,13 @@ from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
 from infrastructure.db.session import create_session_factory
 from infrastructure.logging.logger import configure_logging
 from infrastructure.plugins.base import ProviderRegistry
-from infrastructure.plugins.providers import AnthropicPlugin, GeminiPlugin, OpenAIPlugin, OpenRouterPlugin
+from infrastructure.plugins.providers import (
+    AnthropicPlugin,
+    GeminiPlugin,
+    GeminiWebProxyPlugin,
+    OpenAIPlugin,
+    OpenRouterPlugin,
+)
 
 
 def create_container(settings: Settings) -> punq.Container:
@@ -27,7 +33,6 @@ def create_container(settings: Settings) -> punq.Container:
 
     scorer = KeyScorer(
         ScoreWeights(
-            quota=settings.weight_quota,
             idle=settings.weight_idle,
             success=settings.weight_success,
             error=settings.weight_error,
@@ -46,6 +51,7 @@ def create_container(settings: Settings) -> punq.Container:
     provider_registry.register(AnthropicPlugin())
     provider_registry.register(GeminiPlugin())
     provider_registry.register(OpenRouterPlugin())
+    provider_registry.register(GeminiWebProxyPlugin())
     service = KeyService(
         repository,
         allocation_store,
@@ -53,6 +59,7 @@ def create_container(settings: Settings) -> punq.Container:
         scorer,
         state_machine,
         provider_registry,
+        allocation_lease_seconds=settings.allocate_lease_seconds,
     )
 
     container = punq.Container()

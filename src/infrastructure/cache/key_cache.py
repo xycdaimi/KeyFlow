@@ -26,6 +26,9 @@ class RedisKeyCache(KeyAllocationStore):
     def _key_hash(self, key_id: str) -> str:
         return f"keyflow:key:{key_id}"
 
+    def _provider_lease_zset(self, provider: str) -> str:
+        return f"keyflow:provider:{provider}:leases"
+
     async def sync_key(self, key: ApiKey, score: float) -> None:
         zset_key = self._provider_zset(key.provider)
         hash_key = self._key_hash(key.id)
@@ -45,14 +48,25 @@ class RedisKeyCache(KeyAllocationStore):
         await self._redis.zrem(self._provider_zset(provider), key_id)
         await self._redis.delete(self._key_hash(key_id))
 
-    async def allocate_key(self, provider: str, ordered_key_ids: list[str], now: datetime) -> str | None:
+    async def allocate_key(
+        self,
+        provider: str,
+        ordered_key_ids: list[str],
+        now: datetime,
+        lease_seconds: int = 2,
+    ) -> str | None:
         if not ordered_key_ids:
             return None
         result = await self._redis.eval(
             self._script,
-            1,
+            2,
             self._provider_zset(provider),
+            self._provider_lease_zset(provider),
             str(int(now.astimezone(timezone.utc).timestamp())),
+            str(max(lease_seconds, 1)),
             *ordered_key_ids,
         )
         return result if isinstance(result, str) and result else None
+
+    async def release_key_lease(self, provider: str, key_id: str) -> None:
+        await self._redis.zrem(self._provider_lease_zset(provider), key_id)

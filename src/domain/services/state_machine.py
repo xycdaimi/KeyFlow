@@ -32,10 +32,6 @@ class KeyStateMachine:
             key.status = KeyStatus.DISABLED
             return key
 
-        if key.is_exhausted():
-            key.status = KeyStatus.EXHAUSTED
-            return key
-
         key.status = KeyStatus.AVAILABLE
         return key
 

@@ -6,6 +6,7 @@ from infrastructure.plugins.providers.gemini_web_proxy import GeminiWebProxyPlug
 def test_gemini_web_proxy_returns_known_models() -> None:
     plugin = GeminiWebProxyPlugin()
     assert plugin.name == "gemini-web-proxy"
+    assert plugin.model_source == "static"
     assert len(_KNOWN_MODELS) > 0
 
 
@@ -26,3 +27,13 @@ async def test_gemini_web_proxy_unavailable_without_library() -> None:
         plugin = GeminiWebProxyPlugin()
         result = await plugin.is_credential_available("fake-cookie")
         assert result is False
+
+
+@pytest.mark.anyio
+async def test_gemini_web_proxy_explain_includes_dependency_strategy() -> None:
+    plugin = GeminiWebProxyPlugin()
+    info = await plugin.explain_credential("cookie-value")
+    assert info["provider"] == "gemini-web-proxy"
+    assert info["model_source"] == "static"
+    assert info["dependency"]["name"] == "gemini-webapi"
+    assert "degrade_strategy" in info["dependency"]

@@ -46,6 +46,17 @@ def test_state_machine_applies_backoff_and_recovery() -> None:
     assert key.cooldown_until is None
 
 
+def test_state_machine_handles_generic_error_without_exhaustion_probe() -> None:
+    now = datetime.now(timezone.utc)
+    key = ApiKey(id="k-generic", provider="openai", api_key="sk-test")
+    machine = KeyStateMachine()
+
+    machine.on_error(key, "network_timeout", now)
+
+    assert key.status == KeyStatus.AVAILABLE
+    assert key.error_count == 1
+
+
 def test_scheduler_selects_highest_ranked_key() -> None:
     now = datetime.now(timezone.utc)
     scheduler = KeyScheduler(KeyScorer(), jitter=0.0)

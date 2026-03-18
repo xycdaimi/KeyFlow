@@ -49,6 +49,7 @@ class KeyService:
         scorer: KeyScorer,
         state_machine: KeyStateMachine,
         provider_registry: ProviderRegistry,
+        allocation_lease_seconds: int = 2,
     ) -> None:
         self._repository = repository
         self._allocation_store = allocation_store
@@ -56,6 +57,7 @@ class KeyService:
         self._scorer = scorer
         self._state_machine = state_machine
         self._provider_registry = provider_registry
+        self._allocation_lease_seconds = max(allocation_lease_seconds, 1)
 
     async def create_key(self, data: CreateKeyInput) -> ApiKey:
         now = utcnow()
@@ -94,7 +96,11 @@ class KeyService:
         plugin = self._provider_registry.get(key.provider)
         if plugin is None:
             return {"provider": key.provider, "status": "no_plugin"}
-        return await plugin.explain_credential(key.api_key)
+        try:
+            return await plugin.explain_credential(key.api_key)
+        except Exception as exc:
+            logger.warning("explain_credential failed for %s: %s", key.id, exc)
+            return {"provider": key.provider, "status": "plugin_error", "error_code": "explain_failed"}
 
     async def allocate_key(self, provider: str, model: str | None = None) -> ApiKey:
         now = utcnow()
@@ -113,6 +119,9 @@ class KeyService:
         for key in keys:
             if not key.is_available(now):
                 continue
+            # Local pre-filter when model capability was synced before.
+            if model and key.supported_models and model not in key.supported_models:
+                continue
             if plugin is not None:
                 try:
                     available = await plugin.is_credential_available(key.api_key, model)
@@ -128,7 +137,12 @@ class KeyService:
             raise NoAvailableKeyError("no available key")
 
         ordered_ids = [item.key.id for item in ranked]
-        allocated_id = await self._allocation_store.allocate_key(provider, ordered_ids, now)
+        allocated_id = await self._allocation_store.allocate_key(
+            provider,
+            ordered_ids,
+            now,
+            lease_seconds=self._allocation_lease_seconds,
+        )
         if allocated_id is None:
             raise NoAvailableKeyError("no available key")
 
@@ -147,6 +161,7 @@ class KeyService:
         self._state_machine.on_success(key, tokens_used=tokens_used, now=now)
         await self._repository.upsert_key(key)
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
+        await self._allocation_store.release_key_lease(key.provider, key.id)
         plugin = self._provider_registry.get(key.provider)
         if plugin is not None:
             try:
@@ -161,6 +176,7 @@ class KeyService:
         self._state_machine.on_error(key, error_type=error_type, now=now)
         await self._repository.upsert_key(key)
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
+        await self._allocation_store.release_key_lease(key.provider, key.id)
         plugin = self._provider_registry.get(key.provider)
         if plugin is not None:
             try:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
+import logging
 
 import punq
 from fastapi import FastAPI
@@ -15,6 +17,35 @@ from interfaces.api.routes.allocate import router as allocate_router
 from interfaces.api.routes.health import router as health_router
 from interfaces.api.routes.report import router as report_router
 
+logger = logging.getLogger(__name__)
+DB_SCHEMA_INIT_MAX_ATTEMPTS = 5
+DB_SCHEMA_INIT_RETRY_SECONDS = 2
+
+
+async def ensure_schema_ready(write_engine) -> None:
+    for attempt in range(1, DB_SCHEMA_INIT_MAX_ATTEMPTS + 1):
+        try:
+            async with write_engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            logger.info("event=db_schema_ready source=api_startup attempt=%s", attempt)
+            return
+        except Exception as exc:
+            if attempt >= DB_SCHEMA_INIT_MAX_ATTEMPTS:
+                logger.exception(
+                    "event=db_schema_init_failed source=api_startup attempts=%s error=%s",
+                    attempt,
+                    exc,
+                )
+                raise
+            logger.warning(
+                "event=db_schema_init_retry source=api_startup attempt=%s max_attempts=%s retry_in_seconds=%s error=%s",
+                attempt,
+                DB_SCHEMA_INIT_MAX_ATTEMPTS,
+                DB_SCHEMA_INIT_RETRY_SECONDS,
+                exc,
+            )
+            await asyncio.sleep(DB_SCHEMA_INIT_RETRY_SECONDS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -28,8 +59,9 @@ async def lifespan(app: FastAPI):
     write_engine = repository._write_factory.kw["bind"]
     read_engine = repository._read_factory.kw["bind"]
 
-    async with write_engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    # Startup schema guard:
+    # create_all() only creates missing tables; existing tables are left intact.
+    await ensure_schema_ready(write_engine)
 
     try:
         yield
@@ -43,7 +75,12 @@ def create_app(container: punq.Container | None = None, settings: Settings | Non
     app_settings = settings or get_settings()
     app_container = container or create_container(app_settings)
 
-    app = FastAPI(title=app_settings.app_name, lifespan=lifespan)
+    app = FastAPI(
+        title=app_settings.app_name,
+        description=app_settings.app_description,
+        version=app_settings.app_version,
+        lifespan=lifespan,
+    )
     app.state.settings = app_settings
     app.state.container = app_container
 

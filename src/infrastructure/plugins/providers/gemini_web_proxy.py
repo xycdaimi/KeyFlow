@@ -32,9 +32,23 @@ class GeminiWebProxyPlugin(ProviderPlugin):
     determined solely by cookie validity.
     """
 
+    PLUGIN_VERSION = "1.0.0"
+    PLUGIN_INTERFACE_VERSION = "1.0.0"
+
     @property
     def name(self) -> str:
         return "gemini-web-proxy"
+
+    @property
+    def model_source(self) -> str:
+        return "static"
+
+    def _is_dependency_available(self) -> bool:
+        try:
+            from gemini_webapi import GeminiClient  # type: ignore[import]
+        except ImportError:
+            return False
+        return GeminiClient is not None
 
     async def fetch_models(self, api_key: str) -> list[str]:
         """Return the static list of known Gemini Web models.
@@ -45,9 +59,7 @@ class GeminiWebProxyPlugin(ProviderPlugin):
 
     async def is_credential_available(self, api_key: str, model: str | None = None) -> bool:
         """Verify the cookie is still valid using the gemini_webapi library."""
-        try:
-            from gemini_webapi import GeminiClient  # type: ignore[import]
-        except ImportError:
+        if not self._is_dependency_available():
             logger.warning(
                 "gemini-webapi not installed. "
                 "Run 'pip install gemini-webapi' to enable availability checks."
@@ -55,6 +67,7 @@ class GeminiWebProxyPlugin(ProviderPlugin):
             return False
 
         try:
+            from gemini_webapi import GeminiClient  # type: ignore[import]
             client = GeminiClient(secure_1psid=api_key)
             await client.init(timeout=10, auto_close=True, close_delay=0)
             return True
@@ -63,8 +76,16 @@ class GeminiWebProxyPlugin(ProviderPlugin):
             return False
 
     async def explain_credential(self, api_key: str) -> dict:
+        dependency_available = self._is_dependency_available()
         return {
             "provider": self.name,
+            "status": "unknown" if dependency_available else "dependency_missing",
+            "model_source": self.model_source,
             "auth_type": "cookie (__Secure-1PSID)",
-            "cookie_prefix": api_key[:12] + "…",
+            "credential_hint": api_key[:12] + "***",
+            "dependency": {
+                "name": "gemini-webapi",
+                "installed": dependency_available,
+                "degrade_strategy": "not_allocatable_when_dependency_missing",
+            },
         }

@@ -8,6 +8,9 @@ _BASE_URL = "https://generativelanguage.googleapis.com"
 
 
 class GeminiPlugin(ProviderPlugin):
+    PLUGIN_VERSION = "1.0.0"
+    PLUGIN_INTERFACE_VERSION = "1.0.0"
+
     """Plugin for Google Gemini (generativelanguage API / AI Studio).
 
     Availability: key is valid when the models endpoint returns 200.
@@ -62,4 +65,10 @@ class GeminiPlugin(ProviderPlugin):
             return True
 
     async def explain_credential(self, api_key: str) -> dict:
-        return {"provider": self.name, "key_prefix": api_key[:8] + "…"}
+        return {
+            "provider": self.name,
+            "status": "unknown",
+            "model_source": self.model_source,
+            "auth_type": "x-goog-api-key",
+            "credential_hint": api_key[:8] + "***",
+        }

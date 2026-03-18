@@ -7,5 +7,5 @@ class AllocateKeyQuery:
     def __init__(self, service: KeyService) -> None:
         self._service = service
 
-    async def execute(self, provider: str) -> ApiKey:
-        return await self._service.allocate_key(provider)
+    async def execute(self, provider: str, model: str | None = None) -> ApiKey:
+        return await self._service.allocate_key(provider, model)

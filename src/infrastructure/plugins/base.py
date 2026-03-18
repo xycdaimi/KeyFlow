@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Literal
+
+PLUGIN_INTERFACE_VERSION = "1.0.0"
+ModelSource = Literal["remote", "static"]
 
 
 class ProviderPlugin(ABC):
@@ -19,10 +23,18 @@ class ProviderPlugin(ABC):
     The core must NEVER call or depend on billing logic.
     """
 
+    PLUGIN_VERSION = "1.0.0"
+    PLUGIN_INTERFACE_VERSION = PLUGIN_INTERFACE_VERSION
+
     @property
     @abstractmethod
     def name(self) -> str:
         """Canonical provider identifier, e.g. 'openai'. Always lowercase."""
+
+    @property
+    def model_source(self) -> ModelSource:
+        """Where fetch_models comes from: remote API or static table."""
+        return "remote"
 
     @abstractmethod
     async def fetch_models(self, api_key: str) -> list[str]:
@@ -72,6 +84,11 @@ class ProviderRegistry:
         self._plugins: dict[str, ProviderPlugin] = {}
 
     def register(self, plugin: ProviderPlugin) -> None:
+        if plugin.PLUGIN_INTERFACE_VERSION != PLUGIN_INTERFACE_VERSION:
+            raise ValueError(
+                f"plugin {plugin.name} interface version mismatch: "
+                f"{plugin.PLUGIN_INTERFACE_VERSION} != {PLUGIN_INTERFACE_VERSION}"
+            )
         self._plugins[plugin.name.lower()] = plugin
 
     def get(self, name: str) -> ProviderPlugin | None:

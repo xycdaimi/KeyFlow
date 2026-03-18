@@ -22,7 +22,7 @@ async def allocate_key(
 ) -> AllocateResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
-        key = await service.allocate_key(payload.provider)
+        key = await service.allocate_key(payload.provider, payload.model)
     except NoAvailableKeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

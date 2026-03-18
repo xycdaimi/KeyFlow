@@ -1,269 +1,279 @@
-📌 强制规定：
-✔ 插件必须实现 *账户可用性判断接口*
-✔ 插件内部私有 *余额/用量/价格逻辑，不可对外或给核心使用*
-✔ 核心服务只能看到 *是否可用*
-✔ 自动跳过不可用账户，被禁用的账户也要跳过
-✔ 支持任意凭证形式（API‑Key / Cookie / auth.json / token / session）
-✔ 插件契约明确定义、强约束
+# KeyFlow 插件系统规范
+
+## 1. 设计目标
+
+插件系统的目标是把供应商差异封装起来，让核心调度逻辑保持稳定。
+
+插件负责：
+
+- 识别 provider 差异
+- 获取支持模型
+- 判断凭证当前是否可用
+- 处理 provider 私有认证、余额、套餐、价格等逻辑
+- 返回安全的说明信息供管理界面展示
+
+插件不负责：
+
+- 替代核心数据库保存全部账户
+- 成为系统正式状态的真相源
+- 主导管理端账户 CRUD
 
 ---
 
-## 📄 KeyFlow 插件系统规范（完善版）
+## 2. 核心原则
 
-````markdown
-# KeyFlow 插件系统规范 文档（正式版）
+### 2.1 账户归核心管理
+
+- `api_key` 账户由核心数据库存储
+- 账户 CRUD 由核心接口负责
+- 插件接收的是已有账户中的凭证值
+
+### 2.2 状态归核心管理
+
+核心正式状态由系统维护，例如：
+
+- `AVAILABLE`
+- `RATE_LIMITED`
+- `COOLDOWN`
+- `DISABLED`
+- `EXHAUSTED`
+
+插件可以维护私有临时状态或缓存，但不替代核心正式状态机。
+
+### 2.3 provider 差异归插件
+
+插件负责的典型差异包括：
+
+- HTTP Header 形式不同
+- API Host 不同
+- 模型列表接口不同
+- 鉴权失败判定不同
+- Cookie / session 凭证可用性判断不同
+- provider 私有余额或套餐规则不同
+
+### 2.4 计费逻辑私有化
+
+以下逻辑只能保留在插件内部：
+
+- `get_balance()`
+- `get_usage()`
+- `calculate_cost()`
+- `calculate_remaining_quota()`
+
+核心不能直接依赖这些私有逻辑作为统一接口前提。
 
 ---
 
-## 一、总体设计宗旨
+## 3. 插件契约
 
-### 1.1 核心目标
-KeyFlow 插件系统用于接入任意第三方供应商账户（例如 OpenAI、Gemini Web API、OpenRouter、极客智坊等），实现：
-
-🔹 多供应商凭证池管理  
-🔹 动态调度最优凭证  
-🔹 自动跳过不可用凭证  
-🔹 插件负责账户可/不可用判断  
-🔹 插件内部私有实现 *余额/用量/计费逻辑*，禁止核心调用
-
-> 插件内部可根据供应商真实规则计算余额、消耗、套餐计费等，但这些必须封装在插件内部，不得暴露给 KeyFlow 核心或外部调用者。
-
----
-
-## 二、术语定义
-
-| 术语 | 含义 |
-|------|------|
-| Plugin | 供应商适配插件，为 KeyFlow 接入供应商实现空间 |
-| Credential | 供应商凭证，不论是 API Key / Cookie / Auth JSON / OAuth Token，都是 opaque token |
-| isAvailable | 表示凭证是否当前 *可用* 的布尔判断（插件必须实现） |
-| Balance/Usage/Price | 供应商内部计费逻辑，仅插件内部使用，不对外暴露给核心或调用者 |
-
----
-
-## 三、插件契约与接口规范
-
-### 3.1 插件必须实现的接口契约
-
-**插件暴露给核心的接口必须严格实现以下协议：**
+`v1` 插件契约如下：
 
 ```python
-class Credential:
-    """
-    Opaque credential object.
-    Core does not inspect internal fields.
-    """
-
 class ProviderPlugin(Protocol):
-    name: str                          # 供应商唯一标识
-    supported_models: list[str]       # 插件能支持的模型清单（可选）
+    @property
+    def name(self) -> str:
+        ...
 
-    async def list_credentials() -> list[Credential]
-        """列出插件内部储存的凭证"""
+    async def fetch_models(self, api_key: str) -> list[str]:
+        """返回该凭证支持的模型列表。"""
 
-    async def create_credential(**opts) -> Credential
-        """
-        创建/新增凭证
-        opts 由插件内部解析（例如 Cookie、auth.json、token 等）
-        """
+    async def is_credential_available(self, api_key: str, model: str | None = None) -> bool:
+        """判断该凭证当前是否可用于指定 model。"""
 
-    async def is_credential_available(cred: Credential, model: str) -> bool
-        """
-        判断凭证是否 *可用*（核心调度使用该结果判断是否跳过）
-        该方法必须由插件内部实现凭证有效性逻辑。
-        """
+    async def mark_success(self, api_key: str, meta: dict | None = None) -> None:
+        """可选：成功回调。默认允许为空实现。"""
 
-    async def mark_success(cred: Credential, meta: dict) -> None
-        """上报成功（插件内部可更新失败计数、限流状态等）"""
+    async def mark_error(self, api_key: str, error_meta: dict | None = None) -> None:
+        """可选：失败回调。默认允许为空实现。"""
 
-    async def mark_error(cred: Credential, error_meta: dict) -> None
-        """上报失败（插件内部可决定是否进入冷却/不可用）"""
-````
+    async def explain_credential(self, api_key: str) -> dict:
+        """返回不含敏感字段的安全说明信息。"""
+```
 
 ---
 
-## 四、禁止暴露给核心/外部的逻辑
+## 4. 为什么不使用 list/create 凭证接口
 
-**核心服务不得调用或访问以下内容**
+以下设计不作为 `v1` 插件契约的一部分：
 
-❌ 不得直接调用以下逻辑：
+- `list_credentials()`
+- `create_credential(...)`
 
-```
-get_balance()
-get_usage()
-calculate_cost()
-calculate_remaining_quota()
-```
+原因：
 
-理由：不同供应商计费规则不同，有的甚至无余额概念（如使用 Cookie / session 方式，仅判断登录凭证是否可用），不能统一核心处理。
+- 当前系统已经明确由核心维护账户池
+- 管理接口已经以核心数据库为真相源
+- 若插件也持有完整凭证列表，会形成双真相源
+
+因此 `v1` 的职责划分是：
+
+- 核心：保存和管理账户
+- 插件：解释和验证账户
 
 ---
 
-## 五、账户可用性判断（isAvailable）
+## 5. 可用性判断规范
 
-### 5.1 为什么必须插件负责
-
-有些供应商根本不存在余额/额度 API（例如 Cookie 形式登录凭证），这类凭证“是否可用”仅由 *供应商实际行为判断* 决定，例如：
-
-✔ 能否用当前凭证成功访问一次轻量验证 API
-✔ 是否认证失败（401/403）
-✔ Cookie 是否过期
-✔ OAuth Token 是否已失效
-
-核心服务无法统一这种判断逻辑，必须插件内部实现。
-
-### 5.2 举例说明（伪代码）
+### 5.1 插件必须实现
 
 ```python
-class GeminiWebPlugin(ProviderPlugin):
-    async def is_credential_available(self, cred, model):
-        try:
-            # 访问轻量验证端点，检查返回码
-            result = await gemini_api.check_session(cred)
-            return result.success
-        except AuthenticationError:
-            return False
-        except TransportError:
-            return False
+is_credential_available(api_key, model)
 ```
 
-📌 这种逻辑属于 *插件内部凭证可用性判断*，核心 Service 只根据布尔结果决定是否调度该凭证。
+这是核心调度时使用的唯一 provider 侧可用性信号。
+
+### 5.2 插件可用性判断可以依赖
+
+- 认证是否成功
+- 轻量模型接口是否可访问
+- Cookie 是否过期
+- Token 是否失效
+- provider 私有额度是否耗尽
+- 指定模型是否可用
+
+### 5.3 核心如何使用
+
+核心只根据布尔结果处理：
+
+```text
+False -> 跳过该凭证
+True  -> 允许进入调度候选
+```
+
+核心不要求插件解释全部内部原因。
 
 ---
 
-## 六、调度系统调用流程
+## 6. 插件与核心的交互流程
 
-以下是 Core 调用插件的顺序及跳过逻辑：
+### 6.1 新增账户时
 
-1. 调用 `plugin.list_credentials()` 获取凭证候选列表
-2. 遍历候选凭证：
+1. 管理端创建账户
+2. 核心调用 `fetch_models(api_key)`
+3. 核心保存 `supported_models`
 
-```
-if not plugin.is_credential_available(cred, model):
-    skip this credential  # 自动跳过不可用
-else:
-    add candidate to available list
-```
+### 6.2 分配时
 
-3. 如果 available list 为空：
+1. 核心从数据库加载 provider 下候选账户
+2. 核心先按正式状态过滤
+3. 核心调用 `is_credential_available(api_key, model)`
+4. 核心对可用候选执行统一评分和原子分配
 
-```
-newCred = plugin.create_credential(...)
-if plugin.is_credential_available(newCred, model):
-    use newCred
-else:
-    no available credential
-```
+### 6.3 回写时
 
-4. 按调度算法（如 score 排序等）选择最佳凭证
-
-5. 调用方执行 API 调用，最后根据结果调用：
-
-```
-plugin.mark_success(cred, meta)
-plugin.mark_error(cred, error_meta)
-```
+1. 核心更新正式状态和统计字段
+2. 核心可选调用 `mark_success / mark_error`
+3. 插件可内部更新临时缓存、provider 私有计数或诊断信息
 
 ---
 
-## 七、余额/用量/价格逻辑规范（插件私有）
+## 7. 插件能做什么，不能做什么
 
-插件可以实现供应商内部的计费规则，例如：
+### 7.1 可以做
 
-```
-if supplier has token/paid plans:
-    plugin内部获取余额/使用量
-else:
-    skip balance check entirely
-```
+- 拉取模型列表
+- 判断 cookie / token 是否有效
+- 访问 provider 的余额接口
+- 根据 provider 规则判断“是否还可继续用”
+- 记录 provider 私有告警或统计
+- 生成管理端说明信息
 
-但这一逻辑必须满足：
+### 7.2 不能做
 
-🔒 **核心服务不得访问或调用余额/用量/价格逻辑**
-🔒 插件内部仅用于自身状态判断或监控用途
-
----
-
-## 八、凭证生命周期规范
-
-凭证可能进入以下内部状态：
-
-| 内部状态        | 说明              |
-| ----------- | --------------- |
-| AVAILABLE   | 当前可用            |
-| UNAVAILABLE | 当前不可用           |
-| COOLDOWN    | 由于限流或失败进入冷却     |
-| INVALID     | 永久无效（例如过期/认证失败） |
-
-插件内部负责维护状态变化和存储。
+- 直接覆盖核心数据库里的正式状态
+- 假定自己是账户池的主存储
+- 向核心暴露统一的成本/额度接口并要求核心强依赖
+- 在管理界面说明里暴露原始密钥、cookie、token
 
 ---
 
-## 九、错误上报与状态变化策略
+## 8. 内部私有状态与核心正式状态的关系
 
-当凭证被标记失败时（error）：
+插件内部可以有自己的私有状态，例如：
 
-✔ 插件可根据 `error_meta` 决定是否进入冷却/永久失效
-✔ 核心只传递失败信息，不判断内部原因
-✔ 插件负责更新自身状态
+- `token_invalid`
+- `cookie_expired`
+- `billing_blocked`
+- `provider_cooldown`
+
+但这些状态只作为插件内部判断依据，不直接取代核心正式状态。
+
+推荐关系：
+
+```text
+插件私有状态 -> 提供判断信号 -> 核心状态机落正式状态
+```
+
+例如：
+
+- 插件判断认证失效 -> 核心后续可将账户置为 `DISABLED`
+- 插件判断短期限流 -> 核心可进入 `RATE_LIMITED / COOLDOWN`
 
 ---
 
-## 十、插件版本兼容与加载策略
+## 9. explain_credential 规范
 
-### 10.1 插件元信息
+插件应提供安全说明信息，供管理界面或排障使用。
 
-插件必须声明：
+示例：
 
+```json
+{
+  "provider": "gemini-web-proxy",
+  "status": "unknown",
+  "auth_type": "cookie",
+  "model_support": ["gemini-2.5-pro"],
+  "remark": "credential appears valid"
+}
 ```
-PLUGIN_NAME = "gemini_web"
+
+禁止返回：
+
+- 原始 `api_key`
+- 原始 cookie
+- token 全值
+- 任何可直接复用的敏感凭证字段
+
+---
+
+## 10. 版本兼容
+
+插件至少应声明：
+
+```python
+PLUGIN_NAME = "openai"
 PLUGIN_VERSION = "1.0.0"
 PLUGIN_INTERFACE_VERSION = "1.0.0"
 ```
 
-### 10.2 核心加载规则
+核心加载策略：
 
-* 插件加载时需兼容 CORE 接口版本
-* 否则拒绝加载并记录错误
-
----
-
-## 十一、管理界面/监控集成规范
-
-插件可以提供可选方法：
-
-```
-async explain_credential(cred: Credential) -> dict
-```
-
-用于管理界面展示凭证状态、类型、最后检查时间等，但**不可包含敏感凭证内部字段**。
-
-示例返回结构：
-
-```json
-{
-  "provider": "gemini_web",
-  "status": "AVAILABLE",
-  "last_checked_at": "...",
-  "model_support": ["*"],
-  "remark": "login cookie valid"
-}
-```
+- 接口版本兼容才允许注册
+- 不兼容时应拒绝加载并记录日志
 
 ---
 
-## 十二、总结
+## 11. v2 扩展点
 
-### 核心服务职责
+如果未来要做更强能力，可增加可选扩展接口，而不是污染 `v1` 主契约。
 
-✔ 调用 list_credentials
-✔ 通过 is_credential_available 过滤不可用
-✔ 调度可用凭证
-✔ 反馈成功/失败结果到插件
+例如：
 
-### 插件内部职责
+- `QuotaAwareCapability`
+- `CostAwareCapability`
+- `CredentialFactoryCapability`
+- `HealthProbeCapability`
 
-✔ 实现凭证实际可用性检测
-✔ 管理凭证状态生命周期
-✔ 可实现余额/用量/计费逻辑（但禁止外部访问）
-✔ 解析并存储凭证数据格式（API Key/Cookie/auth etc）
+这些能力只有在系统整体边界确认后再纳入。
+
+---
+
+## 12. 总结
+
+插件系统的统一口径如下：
+
+```text
+核心管理账户，核心维护正式状态，核心负责调度；
+插件封装 provider 差异，插件判断凭证是否可用；
+余额、价格、套餐等业务逻辑留在插件内部，不直接成为 v1 核心接口前提。
+```

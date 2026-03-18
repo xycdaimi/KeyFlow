@@ -8,6 +8,9 @@ _BASE_URL = "https://openrouter.ai"
 
 
 class OpenRouterPlugin(ProviderPlugin):
+    PLUGIN_VERSION = "1.0.0"
+    PLUGIN_INTERFACE_VERSION = "1.0.0"
+
     """Plugin for OpenRouter.
 
     Availability: key is valid AND has remaining credit balance.
@@ -57,12 +60,20 @@ class OpenRouterPlugin(ProviderPlugin):
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             if not r.is_success:
-                return {"provider": self.name, "status": "unknown"}
+                return {
+                    "provider": self.name,
+                    "status": "unknown",
+                    "model_source": self.model_source,
+                    "auth_type": "bearer_api_key",
+                }
             data = r.json().get("data", {})
             limit = float(data.get("limit") or 0)
             usage = float(data.get("usage") or 0)
             return {
                 "provider": self.name,
+                "status": "ok",
+                "model_source": self.model_source,
+                "auth_type": "bearer_api_key",
                 "is_free_tier": data.get("is_free_tier", False),
                 "remaining_usd": round(limit - usage, 4),
                 "label": data.get("label", ""),

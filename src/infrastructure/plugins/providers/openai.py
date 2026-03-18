@@ -8,6 +8,9 @@ _BASE_URL = "https://api.openai.com/v1"
 
 
 class OpenAIPlugin(ProviderPlugin):
+    PLUGIN_VERSION = "1.0.0"
+    PLUGIN_INTERFACE_VERSION = "1.0.0"
+
     """Plugin for the official OpenAI API.
 
     Availability: key is available when the balance is positive AND
@@ -62,4 +65,10 @@ class OpenAIPlugin(ProviderPlugin):
             return True
 
     async def explain_credential(self, api_key: str) -> dict:
-        return {"provider": self.name, "key_prefix": api_key[:8] + "…"}
+        return {
+            "provider": self.name,
+            "status": "unknown",
+            "model_source": self.model_source,
+            "auth_type": "bearer_api_key",
+            "credential_hint": api_key[:8] + "***",
+        }
