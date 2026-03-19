@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     allocate_jitter: float = Field(default=0.01, alias="ALLOCATE_JITTER")
     allocate_lease_seconds: int = Field(default=2, alias="ALLOCATE_LEASE_SECONDS")
     weight_quota: float = Field(default=0.4, alias="WEIGHT_QUOTA")
+    capacity_unknown_fallback: float = Field(default=0.5, alias="CAPACITY_UNKNOWN_FALLBACK")
     weight_idle: float = Field(default=0.25, alias="WEIGHT_IDLE")
     weight_success: float = Field(default=0.2, alias="WEIGHT_SUCCESS")
     weight_error: float = Field(default=0.1, alias="WEIGHT_ERROR")

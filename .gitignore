@@ -8,6 +8,7 @@ ENV/
 env/
 
 tests/
+.worktrees/
 
 __pycache__/
 *.py[cod]

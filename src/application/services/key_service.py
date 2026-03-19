@@ -23,20 +23,17 @@ def utcnow() -> datetime:
 
 @dataclass(slots=True)
 class CreateKeyInput:
-    """Minimum input to add a new api-key account.
-
-    api_key is the account. No display_name, no quota_total.
-    """
+    """Minimum input to add a new credential account."""
 
     provider: str
-    api_key: str
+    credential: dict[str, str]
 
 
 @dataclass(slots=True)
 class UpdateKeyInput:
     """Fields that can be changed by the caller."""
 
-    api_key: str | None = None
+    credential: dict[str, str] | None = None
     status: KeyStatus | None = None
 
 
@@ -64,7 +61,7 @@ class KeyService:
         key = ApiKey(
             id=str(uuid4()),
             provider=data.provider.strip().lower(),
-            api_key=data.api_key,
+            credential=data.credential,
         )
         await self._sync_models(key)
         await self._repository.upsert_key(key)
@@ -73,8 +70,8 @@ class KeyService:
 
     async def update_key(self, key_id: str, data: UpdateKeyInput) -> ApiKey:
         key = await self._get_required_key(key_id)
-        if data.api_key is not None:
-            key.api_key = data.api_key
+        if data.credential is not None:
+            key.credential = data.credential
             await self._sync_models(key)
         if data.status is not None:
             key.status = data.status
@@ -97,10 +94,19 @@ class KeyService:
         if plugin is None:
             return {"provider": key.provider, "status": "no_plugin"}
         try:
-            return await plugin.explain_credential(key.api_key)
+            return await plugin.explain_credential(key.credential)
         except Exception as exc:
             logger.warning("explain_credential failed for %s: %s", key.id, exc)
             return {"provider": key.provider, "status": "plugin_error", "error_code": "explain_failed"}
+
+    async def get_key(self, key_id: str) -> ApiKey:
+        return await self._get_required_key(key_id)
+
+    async def get_key_models(self, provider: str, key_id: str) -> list[str]:
+        key = await self._get_required_key(key_id)
+        if key.provider != provider.strip().lower():
+            raise KeyNotFoundError(f"key {key_id} not found for provider {provider}")
+        return list(key.supported_models)
 
     async def allocate_key(self, provider: str, model: str | None = None) -> ApiKey:
         now = utcnow()
@@ -116,6 +122,7 @@ class KeyService:
 
         # Filter: core state + plugin availability signal
         candidates: list[ApiKey] = []
+        capacity_by_key_id: dict[str, float | None] = {}
         for key in keys:
             if not key.is_available(now):
                 continue
@@ -124,15 +131,23 @@ class KeyService:
                 continue
             if plugin is not None:
                 try:
-                    available = await plugin.is_credential_available(key.api_key, model)
+                    available = await plugin.is_credential_available(key.credential, model)
                 except Exception as exc:
                     logger.warning("is_credential_available raised for %s: %s", key.id, exc)
                     available = False
                 if not available:
                     continue
+                try:
+                    signal = await plugin.get_capacity_signal(key.credential)
+                except Exception as exc:
+                    logger.warning("get_capacity_signal raised for %s: %s", key.id, exc)
+                    signal = None
+                capacity_by_key_id[key.id] = None if signal is None else signal.capacity_score
+            else:
+                capacity_by_key_id[key.id] = None
             candidates.append(key)
 
-        ranked = self._scheduler.rank_keys(candidates, now)
+        ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
         if not ranked:
             raise NoAvailableKeyError("no available key")
 
@@ -165,7 +180,7 @@ class KeyService:
         plugin = self._provider_registry.get(key.provider)
         if plugin is not None:
             try:
-                await plugin.mark_success(key.api_key, {"tokens_used": tokens_used})
+                await plugin.mark_success(key.credential, {"tokens_used": tokens_used})
             except Exception as exc:
                 logger.warning("mark_success failed for %s: %s", key.id, exc)
         return key
@@ -180,7 +195,7 @@ class KeyService:
         plugin = self._provider_registry.get(key.provider)
         if plugin is not None:
             try:
-                await plugin.mark_error(key.api_key, {"error_type": error_type})
+                await plugin.mark_error(key.credential, {"error_type": error_type})
             except Exception as exc:
                 logger.warning("mark_error failed for %s: %s", key.id, exc)
         return key
@@ -210,6 +225,6 @@ class KeyService:
         if plugin is None:
             return
         try:
-            key.supported_models = await plugin.fetch_models(key.api_key)
+            key.supported_models = await plugin.fetch_models(key.credential)
         except Exception as exc:
             logger.warning("fetch_models failed for %s: %s", key.id, exc)

@@ -33,11 +33,13 @@ def create_container(settings: Settings) -> punq.Container:
 
     scorer = KeyScorer(
         ScoreWeights(
+            capacity=settings.weight_quota,
             idle=settings.weight_idle,
             success=settings.weight_success,
             error=settings.weight_error,
             rate_limit=settings.weight_rate_limit,
             cooldown=settings.weight_cooldown,
+            capacity_unknown_fallback=settings.capacity_unknown_fallback,
             idle_cap_seconds=settings.allocate_idle_cap_seconds,
             error_cap=settings.allocate_error_cap,
         )

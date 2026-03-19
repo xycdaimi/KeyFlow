@@ -23,7 +23,27 @@ class AnthropicPlugin(ProviderPlugin):
     def name(self) -> str:
         return "anthropic"
 
-    async def fetch_models(self, api_key: str) -> list[str]:
+    @property
+    def description(self) -> str:
+        return (
+            "Anthropic Claude API（api.anthropic.com）。"
+            "可用性取决于 API Key 是否通过身份验证（Anthropic 无公开余额查询接口）。"
+        )
+
+    @property
+    def auth_type(self) -> str:
+        return "header_api_key"
+
+    @property
+    def credential_hint(self) -> str:
+        return '{"api_key": "sk-ant-..."}（Anthropic API Key）'
+
+    @staticmethod
+    def _api_key(credential: dict[str, str]) -> str:
+        return credential["api_key"]
+
+    async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+        api_key = self._api_key(credential)
         model_ids: list[str] = []
         after_id: str | None = None
 
@@ -50,8 +70,9 @@ class AnthropicPlugin(ProviderPlugin):
 
         return model_ids
 
-    async def is_credential_available(self, api_key: str, model: str | None = None) -> bool:
+    async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
         """Available when the API key authenticates successfully."""
+        api_key = self._api_key(credential)
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 f"{_BASE_URL}/v1/models",
@@ -62,7 +83,8 @@ class AnthropicPlugin(ProviderPlugin):
                 return False
             return True  # 200 or transient error → keep available
 
-    async def explain_credential(self, api_key: str) -> dict:
+    async def explain_credential(self, credential: dict[str, str]) -> dict:
+        api_key = self._api_key(credential)
         return {
             "provider": self.name,
             "status": "unknown",

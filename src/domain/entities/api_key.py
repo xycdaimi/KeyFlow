@@ -14,8 +14,8 @@ def utcnow() -> datetime:
 class ApiKey:
     """An API-key account.
 
-    In KeyFlow the api_key IS the account — one record represents one
-    allocatable credential for a specific provider.
+    In KeyFlow the credential payload IS the account — one record represents
+    one allocatable credential for a specific provider.
 
     Balance, quota, pricing, and billing state are PRIVATE to the provider
     plugin and are never stored here. The scheduler only uses the fields
@@ -24,8 +24,8 @@ class ApiKey:
 
     id: str
     provider: str
-    api_key: str
-    """The actual credential value (Bearer token, API key, cookie token…)."""
+    credential: dict[str, str]
+    """Provider-defined credential payload, e.g. {"api_key": "..."}."""
 
     status: KeyStatus = KeyStatus.AVAILABLE
     quota_used: int = 0

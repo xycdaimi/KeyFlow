@@ -9,11 +9,13 @@ from domain.value_objects.key_status import KeyStatus
 
 @dataclass(slots=True)
 class ScoreWeights:
+    capacity: float = 0.4
     idle: float = 0.35
     success: float = 0.35
     error: float = 0.2
     rate_limit: float = 0.05
     cooldown: float = 0.05
+    capacity_unknown_fallback: float = 0.5
     idle_cap_seconds: int = 300
     error_cap: int = 10
 
@@ -22,7 +24,7 @@ class KeyScorer:
     def __init__(self, weights: ScoreWeights | None = None) -> None:
         self.weights = weights or ScoreWeights()
 
-    def score(self, key: ApiKey, now: datetime) -> float:
+    def score(self, key: ApiKey, now: datetime, capacity_score: float | None = None) -> float:
         if key.status == KeyStatus.DISABLED:
             return float("-inf")
         if key.status == KeyStatus.EXHAUSTED:
@@ -43,8 +45,15 @@ class KeyScorer:
             remaining = (key.cooldown_until - now).total_seconds()
             cooldown_penalty = min(remaining / total, 1.0)
 
+        effective_capacity = (
+            self.weights.capacity_unknown_fallback
+            if capacity_score is None
+            else min(max(capacity_score, 0.0), 1.0)
+        )
+
         return (
-            (self.weights.idle * idle_score)
+            (self.weights.capacity * effective_capacity)
+            + (self.weights.idle * idle_score)
             + (self.weights.success * success_score)
             - (self.weights.error * error_penalty)
             - (self.weights.rate_limit * rate_limit_penalty)

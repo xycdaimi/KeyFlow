@@ -32,5 +32,5 @@ async def allocate_key(
     return AllocateResponse(
         status="ok",
         key_id=key.id,
-        api_key=key.api_key,
+        credential=key.credential,
     )

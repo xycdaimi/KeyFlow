@@ -44,7 +44,7 @@ class SqlAlchemyKeyRepository(KeyRepository):
                 session.add(model)
 
             model.provider = key.provider
-            model.api_key = key.api_key
+            model.credential = key.credential
             model.status = key.status.value
             model.quota_used = key.quota_used
             model.success_count = key.success_count
@@ -79,7 +79,7 @@ class SqlAlchemyKeyRepository(KeyRepository):
         return ApiKey(
             id=model.id,
             provider=model.provider,
-            api_key=model.api_key,
+            credential=model.credential,
             status=KeyStatus(model.status),
             quota_used=model.quota_used,
             last_used_at=model.last_used_at,

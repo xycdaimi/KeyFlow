@@ -15,8 +15,8 @@ class ApiKeyModel(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(64), index=True)
-    api_key: Mapped[str] = mapped_column(String(512))
-    """The actual credential. api_key IS the account."""
+    credential: Mapped[dict] = mapped_column(JSON)
+    """Provider-defined structured credential payload."""
 
     status: Mapped[str] = mapped_column(String(32), default="available")
     quota_used: Mapped[int] = mapped_column(Integer, default=0)

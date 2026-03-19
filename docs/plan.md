@@ -1,6 +1,6 @@
 # KeyFlow 执行清单
 
-> 更新时间：2026-03-18
+> 更新时间：2026-03-19
 > 用途：作为后续直接执行的阶段清单，按勾选推进。
 
 ## 1. 执行原则
@@ -35,7 +35,11 @@ v1 先做稳定调度，不做统一额度经济模型。
 
 ### 当前结论
 
-- 当前处于：`骨架已完成，v1 闭环未完成`
+- 当前处于：`主链路 API 与插件管理面回归已补齐，v1 验收仍未完成`
+- 已确认：`tests/test_api.py`、`tests/test_provider_plugins.py` 当前全绿
+- 已完成：核心凭证模型已从单字符串 `api_key` 重构为结构化 `credential: dict[str, str]`
+- 全量 `pytest` 仍被 `tests/test_gemini_webapi.py` 阻塞：该文件会在导入阶段直接执行真实外部调用，不属于稳定的自动化回归测试形态
+- 仍待补齐：`Lua 并发分配验证`、`Redis/PostgreSQL 真实依赖联调验证`、`Docker/health 端到端验收`
 
 ---
 
@@ -164,12 +168,24 @@ v1 先做稳定调度，不做统一额度经济模型。
 
 目标：用自动化测试固化 `v1`。
 
-- [ ] 默认启动路径测试
-- [ ] 状态机异常路径测试
+- [x] 默认启动路径测试
+- [x] 状态机异常路径测试
 - [ ] Lua 并发分配测试
-- [ ] 带 `model` 的分配测试
-- [ ] CRUD 回归测试
+- [x] 带 `model` 的分配测试
+- [x] CRUD 回归测试
 - [ ] worker 基础测试
+
+当前已验证：
+
+- `tests/test_api.py` 覆盖：默认启动、普通错误路径、带 `model` 分配、CRUD、provider 列表、`explain` 安全返回、cooldown 内联恢复，以及结构化 `credential` 请求/响应
+- `tests/test_provider_plugins.py` 覆盖：`gemini-web-proxy` 静态模型、依赖降级、双 cookie 校验与初始化，`openrouter` 的 `explain_credential` 脱敏说明
+
+当前未验证：
+
+- Redis + Lua 在真实并发下的不重复分配
+- 外部依赖（Redis/PostgreSQL/Docker）联调下的端到端运行面
+- 独立 worker 入口测试（当前实现采用内联 cooldown 恢复，不存在独立 worker 程序）
+- 全量 `pytest` 下如何处理 `tests/test_gemini_webapi.py` 这类真实外部依赖脚本
 
 完成标准：
 
@@ -182,31 +198,31 @@ v1 先做稳定调度，不做统一额度经济模型。
 
 ### 核心能力
 
-- [ ] 可启动的 API 服务
-- [ ] provider 内凭证分配
-- [ ] 成功/失败回写
-- [ ] 限流退避与 cooldown 恢复
-- [ ] 管理端账户 CRUD
-- [ ] 插件可用性判断
+- [x] 可启动的 API 服务
+- [x] provider 内凭证分配
+- [x] 成功/失败回写
+- [x] 限流退避与 cooldown 恢复
+- [x] 管理端账户 CRUD
+- [x] 插件可用性判断
 - [ ] Redis 原子分配
 - [ ] PostgreSQL 持久化
 
 ### 接口能力
 
-- [ ] `POST /api/internal/allocate-key`
-- [ ] `POST /api/internal/report-error`
-- [ ] `POST /api/internal/report-success`
-- [ ] `POST /api/providers/{provider}/keys`
-- [ ] `GET /api/providers/{provider}/keys`
-- [ ] `PUT /api/keys/{id}`
-- [ ] `DELETE /api/keys/{id}`
+- [x] `POST /api/internal/allocate-key`
+- [x] `POST /api/internal/report-error`
+- [x] `POST /api/internal/report-success`
+- [x] `POST /api/providers/{provider}/keys`
+- [x] `GET /api/providers/{provider}/keys`
+- [x] `PUT /api/keys/{id}`
+- [x] `DELETE /api/keys/{id}`
 - [ ] `GET /health`
 
 ### 工程能力
 
 - [ ] `.env` 配置可驱动运行
 - [ ] Docker 本地联调
-- [ ] 基础自动化测试
+- [x] 基础自动化测试
 - [ ] worker 至少支持 cooldown 恢复
 
 ---
