@@ -1,31 +1,38 @@
+# env
 .env
 .env.*
 !.env.example
 
+# virtual env
 .venv/
 venv/
 ENV/
 env/
 
-tests/
+# worktrees
 .worktrees/
 
+# bytecode
 __pycache__/
 *.py[cod]
 *$py.class
 
+# test / lint / coverage
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 .coverage
 .coverage.*
 htmlcov/
+tests/
 
+# build / packaging
 dist/
 build/
 *.egg-info/
+*.egg
+.eggs/
 
+# IDE
 .idea/
 .vscode/
-
-tests/output/

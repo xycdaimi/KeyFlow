@@ -1,5 +1,0 @@
-application
-container
-domain
-infrastructure
-interfaces
