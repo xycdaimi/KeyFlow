@@ -36,6 +36,12 @@ class ApiKey:
     cooldown_until: datetime | None = None
     disabled_reason: str | None = None
     supported_models: list = field(default_factory=list)
+    last_refreshed_at: datetime | None = None
+    """Last time this key's availability/capacity was refreshed by the background task."""
+    cached_available: bool | None = None
+    """Cached availability from plugin. None = not yet refreshed."""
+    cached_capacity_score: float | None = None
+    """Cached capacity score from plugin. None = unknown or not refreshed."""
     """Model IDs fetched from the provider once at registration."""
 
     def idle_seconds(self, now: datetime | None = None) -> float:

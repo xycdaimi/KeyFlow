@@ -16,6 +16,12 @@ class KeyRepository(Protocol):
     async def get_key(self, key_id: str) -> ApiKey | None:
         ...
 
+    async def get_by_provider_credential(
+        self, provider: str, credential: dict[str, str]
+    ) -> ApiKey | None:
+        """Return existing key with same provider and credential, or None."""
+        ...
+
     async def upsert_key(self, key: ApiKey) -> ApiKey:
         ...
 
@@ -23,6 +29,17 @@ class KeyRepository(Protocol):
         ...
 
     async def list_recoverable_keys(self, now: datetime) -> list[ApiKey]:
+        ...
+
+    async def list_keys_needing_refresh(
+        self, cutoff: datetime, provider: str | None = None
+    ) -> list[ApiKey]:
+        """List keys whose last_refreshed_at is None or older than cutoff."""
+        ...
+
+    async def claim_refresh(self, key_id: str, now: datetime, max_age_seconds: int) -> bool:
+        """Atomically claim the right to refresh this key. Returns True if claimed.
+        Prevents duplicate refresh across multiple processes."""
         ...
 
 

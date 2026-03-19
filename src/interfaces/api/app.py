@@ -7,6 +7,9 @@ import logging
 import punq
 from fastapi import FastAPI
 
+from sqlalchemy import text
+
+from application.services.key_service import KeyService
 from container.container import create_container
 from infrastructure.cache.key_cache import RedisKeyCache
 from infrastructure.config.settings import Settings, get_settings
@@ -47,11 +50,51 @@ async def ensure_schema_ready(write_engine) -> None:
             await asyncio.sleep(DB_SCHEMA_INIT_RETRY_SECONDS)
 
 
+async def ensure_refresh_columns(conn) -> None:
+    """Add last_refreshed_at, cached_available, cached_capacity_score if missing."""
+    for col, sql_type in [
+        ("last_refreshed_at", "TIMESTAMP WITH TIME ZONE"),
+        ("cached_available", "BOOLEAN"),
+        ("cached_capacity_score", "DOUBLE PRECISION"),
+    ]:
+        await conn.execute(
+            text(f"ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS {col} {sql_type}")
+        )
+
+
+async def run_background_tasks(
+    key_service: KeyService,
+    interval_seconds: int,
+    stop_event: asyncio.Event,
+) -> None:
+    """Periodically run recover_cooldowns and refresh_keys."""
+    while not stop_event.is_set():
+        try:
+            recovered = await key_service.recover_cooldowns()
+            refreshed = await key_service.refresh_keys()
+            if recovered or refreshed:
+                logger.info(
+                    "event=background_task source=keyflow recovered=%s refreshed=%s",
+                    recovered,
+                    refreshed,
+                )
+        except Exception as exc:
+            logger.warning("event=background_task_error source=keyflow error=%s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            break
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         repository: SqlAlchemyKeyRepository = app.state.container.resolve(SqlAlchemyKeyRepository)
         redis_cache: RedisKeyCache = app.state.container.resolve(RedisKeyCache)
+        key_service: KeyService = app.state.container.resolve(KeyService)
+        settings: Settings = app.state.container.resolve(Settings)
     except Exception:
         yield
         return
@@ -63,9 +106,27 @@ async def lifespan(app: FastAPI):
     # create_all() only creates missing tables; existing tables are left intact.
     await ensure_schema_ready(write_engine)
 
+    async with write_engine.begin() as conn:
+        await ensure_refresh_columns(conn)
+
+    stop_event = asyncio.Event()
+    bg_task = asyncio.create_task(
+        run_background_tasks(
+            key_service,
+            settings.background_task_interval_seconds,
+            stop_event,
+        )
+    )
+
     try:
         yield
     finally:
+        stop_event.set()
+        bg_task.cancel()
+        try:
+            await bg_task
+        except asyncio.CancelledError:
+            pass
         await redis_cache._redis.aclose()
         await write_engine.dispose()
         await read_engine.dispose()

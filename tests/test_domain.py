@@ -3,8 +3,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from application.services.key_service import KeyService
+from application.services.key_service import CreateKeyInput, KeyService, UpdateKeyInput
 from domain.entities.api_key import ApiKey
+from domain.exceptions.domain_exceptions import DuplicateCredentialError
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer, ScoreWeights
 from domain.services.state_machine import KeyStateMachine
@@ -139,6 +140,9 @@ async def test_service_allocate_by_model_prefers_best_key_across_providers() -> 
                 credential={"api_key": "sk-openai"},
                 supported_models=["gpt-4o"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.1,
             ),
             ApiKey(
                 id="openrouter-high",
@@ -146,6 +150,9 @@ async def test_service_allocate_by_model_prefers_best_key_across_providers() -> 
                 credential={"api_key": "sk-openrouter"},
                 supported_models=["gpt-4o"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
             ),
         ]
     )
@@ -196,6 +203,9 @@ async def test_service_allocate_by_model_excludes_keys_without_target_model_supp
                 credential={"api_key": "sk-openai"},
                 supported_models=["gpt-3.5-turbo"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
             ),
             ApiKey(
                 id="anthropic-supported",
@@ -203,6 +213,9 @@ async def test_service_allocate_by_model_excludes_keys_without_target_model_supp
                 credential={"api_key": "sk-anthropic"},
                 supported_models=["gpt-4o"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.1,
             ),
         ]
     )
@@ -299,6 +312,64 @@ async def test_recover_ready_keys_only_persists_keys_that_changed_status() -> No
     assert repository._keys["recoverable"].status == KeyStatus.AVAILABLE
     assert repository._keys["recoverable"].cooldown_until is None
     assert repository._keys["still-cooling"].status == KeyStatus.COOLDOWN
+
+
+@pytest.mark.anyio
+async def test_create_key_rejects_duplicate_credential_within_same_provider() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="existing-openai",
+                provider="openai",
+                credential={"api_key": "sk-same"},
+            ),
+            ApiKey(
+                id="existing-openrouter",
+                provider="openrouter",
+                credential={"api_key": "sk-same"},
+            ),
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    with pytest.raises(DuplicateCredentialError):
+        await service.create_key(CreateKeyInput(provider="openai", credential={"api_key": "sk-same"}))
+
+
+@pytest.mark.anyio
+async def test_update_key_rejects_duplicate_credential_within_same_provider() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-a",
+                provider="openai",
+                credential={"api_key": "sk-a"},
+            ),
+            ApiKey(
+                id="key-b",
+                provider="openai",
+                credential={"api_key": "sk-b"},
+            ),
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    with pytest.raises(DuplicateCredentialError):
+        await service.update_key("key-b", UpdateKeyInput(credential={"api_key": "sk-a"}))
 
 
 @pytest.mark.anyio

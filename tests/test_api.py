@@ -56,6 +56,7 @@ def build_test_client(
 
 
 def build_client(plugin_available: bool = True) -> TestClient:
+    now = datetime.now(timezone.utc)
     plugin = FakeProviderPlugin("openai", ["gpt-4o", "gpt-4o-mini"], available=plugin_available)
     repository = InMemoryKeyRepository(
         [
@@ -64,7 +65,10 @@ def build_client(plugin_available: bool = True) -> TestClient:
                 provider="openai",
                 credential={"api_key": "sk-test"},
                 quota_used=0,
-                last_used_at=datetime.now(timezone.utc),
+                last_used_at=now,
+                last_refreshed_at=now,
+                cached_available=plugin_available,
+                cached_capacity_score=None,
             )
         ]
     )
@@ -83,6 +87,7 @@ def build_cross_provider_client(
         if plugins is None
         else plugins
     )
+    now = datetime.now(timezone.utc)
     resolved_keys = (
         [
             ApiKey(
@@ -90,14 +95,20 @@ def build_cross_provider_client(
                 provider="openai",
                 credential={"api_key": "sk-openai"},
                 supported_models=["gpt-4o", "gpt-4o-mini"],
-                last_used_at=datetime.now(timezone.utc),
+                last_used_at=now,
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=None,
             ),
             ApiKey(
                 id="key-openrouter",
                 provider="openrouter",
                 credential={"api_key": "sk-openrouter"},
                 supported_models=["gpt-4o"],
-                last_used_at=datetime.now(timezone.utc),
+                last_used_at=now,
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=None,
             ),
         ]
         if keys is None
@@ -158,6 +169,7 @@ def test_allocate_and_report_cycle() -> None:
 
 
 def test_allocate_recovers_expired_cooldown_inline() -> None:
+    now = datetime.now(timezone.utc)
     repository = InMemoryKeyRepository(
         [
             ApiKey(
@@ -165,7 +177,10 @@ def test_allocate_recovers_expired_cooldown_inline() -> None:
                 provider="openai",
                 credential={"api_key": "sk-cooldown"},
                 status=KeyStatus.RATE_LIMITED,
-                cooldown_until=datetime.now(timezone.utc) - timedelta(seconds=1),
+                cooldown_until=now - timedelta(seconds=1),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=None,
             )
         ]
     )
@@ -210,6 +225,7 @@ def test_plugin_unavailable_blocks_allocation() -> None:
 
 
 def test_allocate_passes_model_to_plugin() -> None:
+    """Allocation with model uses cached availability; model filters by supported_models."""
     client = build_client()
 
     response = client.post(
@@ -218,14 +234,11 @@ def test_allocate_passes_model_to_plugin() -> None:
         headers={"X-Internal-Key": "test-key"},
     )
     assert response.status_code == 200
-
-    plugin: FakeProviderPlugin = client.app.state.test_plugin
-    assert plugin.available_checks
-    assert plugin.available_checks[-1][1] == "gpt-4o"
-    assert plugin.available_checks[-1][0] == {"api_key": "sk-test"}
+    assert response.json()["key_id"] == "key-1"
 
 
 def test_allocate_uses_supported_models_local_prefilter() -> None:
+    now = datetime.now(timezone.utc)
     repository = InMemoryKeyRepository(
         [
             ApiKey(
@@ -233,12 +246,18 @@ def test_allocate_uses_supported_models_local_prefilter() -> None:
                 provider="openai",
                 credential={"api_key": "sk-bad"},
                 supported_models=["gpt-3.5-turbo"],
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=None,
             ),
             ApiKey(
                 id="key-match",
                 provider="openai",
                 credential={"api_key": "sk-good"},
                 supported_models=["gpt-4o"],
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=None,
             ),
         ]
     )
@@ -294,6 +313,9 @@ def test_allocate_key_remains_provider_scoped_with_cross_provider_route_present(
                 credential={"api_key": "sk-openai"},
                 supported_models=["gpt-4o"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.1,
             ),
             ApiKey(
                 id="key-openrouter",
@@ -301,6 +323,9 @@ def test_allocate_key_remains_provider_scoped_with_cross_provider_route_present(
                 credential={"api_key": "sk-openrouter"},
                 supported_models=["gpt-4o"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
             ),
         ],
         plugins=[
@@ -338,10 +363,6 @@ def test_allocate_key_remains_provider_scoped_with_cross_provider_route_present(
     assert response.status_code == 200
     assert response.json()["key_id"] == "key-openai"
 
-    plugins: dict[str, FakeProviderPlugin] = client.app.state.test_plugins
-    assert plugins["openai"].available_checks == [({"api_key": "sk-openai"}, "gpt-4o")]
-    assert plugins["openrouter"].available_checks == []
-
 
 @pytest.mark.anyio
 async def test_allocate_by_model_passes_ranked_candidates_to_allocation_store() -> None:
@@ -354,6 +375,9 @@ async def test_allocate_by_model_passes_ranked_candidates_to_allocation_store() 
                 credential={"api_key": "sk-openai"},
                 supported_models=["gpt-4o"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.1,
             ),
             ApiKey(
                 id="openrouter-high",
@@ -361,6 +385,9 @@ async def test_allocate_by_model_passes_ranked_candidates_to_allocation_store() 
                 credential={"api_key": "sk-openrouter"},
                 supported_models=["gpt-4o"],
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
             ),
         ]
     )
@@ -449,12 +476,18 @@ def test_allocate_prefers_higher_capacity_signal_when_health_equal() -> None:
                 provider="openrouter",
                 credential={"api_key": "sk-low"},
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.1,
             ),
             ApiKey(
                 id="key-high",
                 provider="openrouter",
                 credential={"api_key": "sk-high"},
                 last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
             ),
         ]
     )
@@ -622,6 +655,50 @@ def test_admin_key_crud_and_model_sync() -> None:
     delete_response = client.delete(f"/api/keys/{key_id}")
     assert delete_response.status_code == 200
     assert delete_response.json() == {"status": "ok"}
+
+
+def test_create_key_rejects_duplicate_credential_within_same_provider() -> None:
+    client = build_client()
+
+    response = client.post(
+        "/api/providers/openai/keys",
+        json={"credential": {"api_key": "sk-test"}},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "duplicate_credential"}
+
+
+def test_update_key_rejects_duplicate_credential_within_same_provider() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-a",
+                provider="openai",
+                credential={"api_key": "sk-a"},
+                last_refreshed_at=now,
+                cached_available=True,
+            ),
+            ApiKey(
+                id="key-b",
+                provider="openai",
+                credential={"api_key": "sk-b"},
+                last_refreshed_at=now,
+                cached_available=True,
+            ),
+        ]
+    )
+    plugin = FakeProviderPlugin("openai", ["gpt-4o"], available=True)
+    client = build_test_client(repository=repository, plugins=[plugin])
+
+    response = client.put(
+        "/api/keys/key-b",
+        json={"credential": {"api_key": "sk-a"}},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "duplicate_credential"}
 
 
 def test_get_key_models_rejects_provider_mismatch() -> None:

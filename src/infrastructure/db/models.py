@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Integer, String
+from sqlalchemy import JSON, DateTime, Float, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -27,3 +27,9 @@ class ApiKeyModel(Base):
     disabled_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     supported_models: Mapped[list] = mapped_column(JSON, default=list)
     """Model IDs fetched at registration. Informational only."""
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    """Last time availability/capacity was refreshed. Used to avoid duplicate refresh across processes."""
+    cached_available: Mapped[bool | None] = mapped_column(nullable=True)
+    """Cached is_credential_available result. None = not yet refreshed."""
+    cached_capacity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """Cached capacity score from plugin. None = unknown."""

@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     weight_error: float = Field(default=0.1, alias="WEIGHT_ERROR")
     weight_rate_limit: float = Field(default=0.03, alias="WEIGHT_RATE_LIMIT")
     weight_cooldown: float = Field(default=0.02, alias="WEIGHT_COOLDOWN")
+    refresh_cache_seconds: int = Field(default=60, alias="REFRESH_CACHE_SECONDS")
+    """Cache validity. Keys with last_refreshed_at within this window use cached availability."""
+    background_task_interval_seconds: int = Field(default=60, alias="BACKGROUND_TASK_INTERVAL_SECONDS")
+    """Interval for recover_cooldowns and refresh_keys background task."""
 
 
 @lru_cache(maxsize=1)

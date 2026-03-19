@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from application.services.key_service import CreateKeyInput, KeyService, UpdateKeyInput
 from domain.entities.api_key import ApiKey
-from domain.exceptions.domain_exceptions import KeyNotFoundError
+from domain.exceptions.domain_exceptions import DuplicateCredentialError, KeyNotFoundError
 from infrastructure.plugins.base import ProviderRegistry
 from interfaces.api.deps import get_key_service, get_provider_registry
 from interfaces.schemas.request import CreateKeyRequest, UpdateKeyRequest
@@ -39,7 +39,10 @@ async def create_key(
     payload: CreateKeyRequest,
     service: KeyService = Depends(get_key_service),
 ) -> CreateKeyResponse:
-    key = await service.create_key(CreateKeyInput(provider=provider, credential=payload.credential))
+    try:
+        key = await service.create_key(CreateKeyInput(provider=provider, credential=payload.credential))
+    except DuplicateCredentialError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate_credential") from exc
     return CreateKeyResponse(status="ok", key_id=key.id)
 
 
@@ -85,6 +88,8 @@ async def update_key(
 ) -> OperationStatusResponse:
     try:
         await service.update_key(key_id, UpdateKeyInput(credential=payload.credential, status=payload.status))
+    except DuplicateCredentialError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate_credential") from exc
     except KeyNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key_not_found") from exc
     return OperationStatusResponse(status="ok")

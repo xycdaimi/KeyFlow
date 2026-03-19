@@ -62,6 +62,7 @@ def create_container(settings: Settings) -> punq.Container:
         state_machine,
         provider_registry,
         allocation_lease_seconds=settings.allocate_lease_seconds,
+        refresh_cache_seconds=settings.refresh_cache_seconds,
     )
 
     container = punq.Container()

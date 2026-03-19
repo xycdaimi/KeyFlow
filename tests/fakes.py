@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 
 from domain.entities.api_key import ApiKey
@@ -21,6 +22,16 @@ class InMemoryKeyRepository:
     async def get_key(self, key_id: str) -> ApiKey | None:
         return self._keys.get(key_id)
 
+    async def get_by_provider_credential(
+        self, provider: str, credential: dict[str, str]
+    ) -> ApiKey | None:
+        for key in self._keys.values():
+            if key.provider == provider and json.dumps(key.credential, sort_keys=True) == json.dumps(
+                credential, sort_keys=True
+            ):
+                return key
+        return None
+
     async def upsert_key(self, key: ApiKey) -> ApiKey:
         self._keys[key.id] = key
         return key
@@ -34,6 +45,30 @@ class InMemoryKeyRepository:
             for key in self._keys.values()
             if key.cooldown_until is not None and key.cooldown_until <= now
         ]
+
+    async def list_keys_needing_refresh(
+        self, cutoff: datetime, provider: str | None = None
+    ) -> list[ApiKey]:
+        keys = [
+            key
+            for key in self._keys.values()
+            if key.last_refreshed_at is None or key.last_refreshed_at < cutoff
+        ]
+        if provider:
+            keys = [k for k in keys if k.provider == provider]
+        return keys
+
+    async def claim_refresh(self, key_id: str, now: datetime, max_age_seconds: int) -> bool:
+        from datetime import timedelta
+
+        key = self._keys.get(key_id)
+        if key is None:
+            return False
+        cutoff = now - timedelta(seconds=max_age_seconds)
+        if key.last_refreshed_at is not None and key.last_refreshed_at >= cutoff:
+            return False
+        key.last_refreshed_at = now
+        return True
 
 
 class InMemoryAllocationStore:
