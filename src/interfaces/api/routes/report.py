@@ -9,7 +9,7 @@ from infrastructure.config.settings import Settings
 from interfaces.api.deps import get_key_service, get_settings
 from interfaces.middleware.auth import verify_internal_key
 from interfaces.schemas.request import ReportErrorRequest, ReportSuccessRequest
-from interfaces.schemas.response import GenericStatusResponse, KeyResponse
+from interfaces.schemas.response import KeyResponse
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -26,31 +26,31 @@ def _key_response(key: ApiKey) -> KeyResponse:
     )
 
 
-@router.post("/report-error", response_model=GenericStatusResponse)
+@router.post("/report-error", response_model=KeyResponse)
 async def report_error(
     payload: ReportErrorRequest,
     x_internal_key: Annotated[str | None, Header()] = None,
     service: KeyService = Depends(get_key_service),
     settings: Settings = Depends(get_settings),
-) -> GenericStatusResponse:
+) -> KeyResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
         key = await service.report_error(payload.key_id, payload.error_type)
     except KeyNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key_not_found") from exc
-    return GenericStatusResponse(status="ok", key=_key_response(key))
+    return _key_response(key)
 
 
-@router.post("/report-success", response_model=GenericStatusResponse)
+@router.post("/report-success", response_model=KeyResponse)
 async def report_success(
     payload: ReportSuccessRequest,
     x_internal_key: Annotated[str | None, Header()] = None,
     service: KeyService = Depends(get_key_service),
     settings: Settings = Depends(get_settings),
-) -> GenericStatusResponse:
+) -> KeyResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
         key = await service.report_success(payload.key_id, payload.tokens_used)
     except KeyNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key_not_found") from exc
-    return GenericStatusResponse(status="ok", key=_key_response(key))
+    return _key_response(key)

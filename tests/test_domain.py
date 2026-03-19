@@ -1,10 +1,22 @@
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
+from application.services.key_service import KeyService
 from domain.entities.api_key import ApiKey
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer, ScoreWeights
 from domain.services.state_machine import KeyStateMachine
 from domain.value_objects.key_status import KeyStatus
+from infrastructure.plugins.base import CapacitySignal
+from tests.fakes import (
+    FakeProviderPlugin,
+    InMemoryAllocationStore,
+    InMemoryAnyProviderAllocationStore,
+    InMemoryKeyRepository,
+    build_provider_registry,
+)
 
 
 def test_scorer_prefers_healthier_key() -> None:
@@ -114,3 +126,219 @@ def test_scheduler_uses_capacity_signal_as_runtime_tiebreaker() -> None:
     )
 
     assert selected.id == "high"
+
+
+@pytest.mark.anyio
+async def test_service_allocate_by_model_prefers_best_key_across_providers() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="openai-low",
+                provider="openai",
+                credential={"api_key": "sk-openai"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+            ApiKey(
+                id="openrouter-high",
+                provider="openrouter",
+                credential={"api_key": "sk-openrouter"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+        ]
+    )
+    allocation_store = InMemoryAnyProviderAllocationStore()
+    scorer = KeyScorer()
+    scheduler = KeyScheduler(scorer, jitter=0.0)
+    state_machine = KeyStateMachine()
+    provider_registry = build_provider_registry(
+        FakeProviderPlugin(
+            "openai",
+            ["gpt-4o"],
+            available=True,
+            capacity_signal=CapacitySignal(
+                has_capacity_signal=True,
+                capacity_score=0.1,
+                capacity_kind="remaining_budget_ratio",
+                reason="low capacity",
+            ),
+        ),
+        FakeProviderPlugin(
+            "openrouter",
+            ["gpt-4o"],
+            available=True,
+            capacity_signal=CapacitySignal(
+                has_capacity_signal=True,
+                capacity_score=0.9,
+                capacity_kind="remaining_budget_ratio",
+                reason="high capacity",
+            ),
+        ),
+    )
+    service = KeyService(repository, allocation_store, scheduler, scorer, state_machine, provider_registry)
+
+    selected = await service.allocate_key_by_model("gpt-4o")
+
+    assert selected.id == "openrouter-high"
+    assert allocation_store.any_provider_ordered_ids == ["openrouter-high", "openai-low"]
+
+
+@pytest.mark.anyio
+async def test_service_allocate_by_model_excludes_keys_without_target_model_support() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="openai-unsupported",
+                provider="openai",
+                credential={"api_key": "sk-openai"},
+                supported_models=["gpt-3.5-turbo"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+            ApiKey(
+                id="anthropic-supported",
+                provider="anthropic",
+                credential={"api_key": "sk-anthropic"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+        ]
+    )
+    allocation_store = InMemoryAnyProviderAllocationStore()
+    scorer = KeyScorer()
+    scheduler = KeyScheduler(scorer, jitter=0.0)
+    state_machine = KeyStateMachine()
+    provider_registry = build_provider_registry(
+        FakeProviderPlugin(
+            "openai",
+            ["gpt-3.5-turbo"],
+            available=True,
+            capacity_signal=CapacitySignal(
+                has_capacity_signal=True,
+                capacity_score=0.9,
+                capacity_kind="remaining_budget_ratio",
+                reason="would win if not filtered",
+            ),
+        ),
+        FakeProviderPlugin(
+            "anthropic",
+            ["gpt-4o"],
+            available=True,
+            capacity_signal=CapacitySignal(
+                has_capacity_signal=True,
+                capacity_score=0.1,
+                capacity_kind="remaining_budget_ratio",
+                reason="supported target model",
+            ),
+        ),
+    )
+    service = KeyService(repository, allocation_store, scheduler, scorer, state_machine, provider_registry)
+
+    selected = await service.allocate_key_by_model("gpt-4o")
+
+    assert selected.id == "anthropic-supported"
+    assert allocation_store.any_provider_ordered_ids == ["anthropic-supported"]
+
+
+@pytest.mark.anyio
+async def test_recover_ready_keys_only_persists_keys_that_changed_status() -> None:
+    now = datetime.now(timezone.utc)
+
+    class SpyKeyRepository(InMemoryKeyRepository):
+        def __init__(self, keys: list[ApiKey]) -> None:
+            super().__init__(keys)
+            self.upserted_ids: list[str] = []
+
+        async def upsert_key(self, key: ApiKey) -> ApiKey:
+            self.upserted_ids.append(key.id)
+            return await super().upsert_key(key)
+
+        async def list_provider_keys(self, provider: str) -> list[ApiKey]:
+            return [deepcopy(key) for key in await super().list_provider_keys(provider)]
+
+    repository = SpyKeyRepository(
+        [
+            ApiKey(
+                id="already-available",
+                provider="openai",
+                credential={"api_key": "sk-ready"},
+                status=KeyStatus.AVAILABLE,
+            ),
+            ApiKey(
+                id="recoverable",
+                provider="openai",
+                credential={"api_key": "sk-recover"},
+                status=KeyStatus.RATE_LIMITED,
+                cooldown_until=now - timedelta(seconds=1),
+            ),
+            ApiKey(
+                id="still-cooling",
+                provider="openai",
+                credential={"api_key": "sk-cooling"},
+                status=KeyStatus.RATE_LIMITED,
+                cooldown_until=now + timedelta(seconds=30),
+            ),
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    keys = await repository.list_provider_keys("openai")
+    await service._recover_ready_keys(keys, now)
+
+    assert repository.upserted_ids == ["recoverable", "still-cooling"]
+    assert repository._keys["already-available"].status == KeyStatus.AVAILABLE
+    assert repository._keys["recoverable"].status == KeyStatus.AVAILABLE
+    assert repository._keys["recoverable"].cooldown_until is None
+    assert repository._keys["still-cooling"].status == KeyStatus.COOLDOWN
+
+
+@pytest.mark.anyio
+async def test_in_memory_allocation_store_skips_removed_keys() -> None:
+    store = InMemoryAllocationStore()
+    now = datetime.now(timezone.utc)
+
+    await store.remove_key("key-1", "openai")
+
+    allocated = await store.allocate_key("openai", ["key-1", "key-2"], now)
+
+    assert allocated == "key-2"
+    assert store.allocate_calls == [("openai", ["key-1", "key-2"])]
+
+
+@pytest.mark.anyio
+async def test_in_memory_allocation_store_honors_active_lease_until_release() -> None:
+    store = InMemoryAllocationStore()
+    now = datetime.now(timezone.utc)
+
+    first = await store.allocate_key("openai", ["key-1", "key-2"], now)
+    second = await store.allocate_key("openai", ["key-1", "key-2"], now)
+    await store.release_key_lease("openai", "key-1")
+    third = await store.allocate_key("openai", ["key-1", "key-2"], now)
+
+    assert first == "key-1"
+    assert second == "key-2"
+    assert third == "key-1"
+    assert store.released == [("openai", "key-1")]
+
+
+@pytest.mark.anyio
+async def test_in_memory_allocation_store_reuses_key_after_lease_expires() -> None:
+    store = InMemoryAllocationStore()
+    now = datetime.now(timezone.utc)
+
+    first = await store.allocate_key("openai", ["key-1", "key-2"], now, lease_seconds=2)
+    second = await store.allocate_key("openai", ["key-1", "key-2"], now + timedelta(seconds=1), lease_seconds=2)
+    third = await store.allocate_key("openai", ["key-1", "key-2"], now + timedelta(seconds=3), lease_seconds=2)
+
+    assert first == "key-1"
+    assert second == "key-2"
+    assert third == "key-1"

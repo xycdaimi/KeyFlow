@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from application.services.key_service import KeyService
 from domain.entities.api_key import ApiKey
+from domain.exceptions.domain_exceptions import NoAvailableKeyError
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer
 from domain.services.state_machine import KeyStateMachine
@@ -17,7 +18,45 @@ from interfaces.api.app import create_app, ensure_schema_ready
 from tests.fakes import FakeProviderPlugin, InMemoryAllocationStore, InMemoryKeyRepository, build_provider_registry
 
 
+def build_settings() -> Settings:
+    return Settings(
+        APP_NAME="KeyFlowTest",
+        API_PREFIX="/api",
+        INTERNAL_API_KEY="test-key",
+        DATABASE_URL_READ="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
+        DATABASE_URL_WRITE="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
+        REDIS_URL="redis://localhost:6379/9",
+    )
+
+
+def build_test_client(
+    *,
+    repository: InMemoryKeyRepository,
+    plugins: list[FakeProviderPlugin],
+    allocation_store: InMemoryAllocationStore | None = None,
+) -> TestClient:
+    resolved_allocation_store = allocation_store or InMemoryAllocationStore()
+    scorer = KeyScorer()
+    scheduler = KeyScheduler(scorer, jitter=0.0)
+    state_machine = KeyStateMachine()
+    provider_registry = build_provider_registry(*plugins)
+    service = KeyService(repository, resolved_allocation_store, scheduler, scorer, state_machine, provider_registry)
+
+    container = punq.Container()
+    settings = build_settings()
+    container.register(KeyService, instance=service)
+    container.register(Settings, instance=settings)
+    container.register(ProviderRegistry, instance=provider_registry)
+    app = create_app(container=container, settings=settings)
+    app.state.test_allocation_store = resolved_allocation_store
+    app.state.test_plugins = {plugin.name: plugin for plugin in plugins}
+    if len(plugins) == 1:
+        app.state.test_plugin = plugins[0]
+    return TestClient(app)
+
+
 def build_client(plugin_available: bool = True) -> TestClient:
+    plugin = FakeProviderPlugin("openai", ["gpt-4o", "gpt-4o-mini"], available=plugin_available)
     repository = InMemoryKeyRepository(
         [
             ApiKey(
@@ -29,30 +68,68 @@ def build_client(plugin_available: bool = True) -> TestClient:
             )
         ]
     )
-    allocation_store = InMemoryAllocationStore()
-    scorer = KeyScorer()
-    scheduler = KeyScheduler(scorer, jitter=0.0)
-    state_machine = KeyStateMachine()
-    plugin = FakeProviderPlugin("openai", ["gpt-4o", "gpt-4o-mini"], available=plugin_available)
-    provider_registry = build_provider_registry(plugin)
-    service = KeyService(repository, allocation_store, scheduler, scorer, state_machine, provider_registry)
+    return build_test_client(repository=repository, plugins=[plugin])
 
-    container = punq.Container()
-    settings = Settings(
-        APP_NAME="KeyFlowTest",
-        API_PREFIX="/api",
-        INTERNAL_API_KEY="test-key",
-        DATABASE_URL_READ="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        DATABASE_URL_WRITE="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        REDIS_URL="redis://localhost:6379/9",
+
+def build_cross_provider_client(
+    keys: list[ApiKey] | None = None,
+    plugins: list[FakeProviderPlugin] | None = None,
+) -> TestClient:
+    resolved_plugins = (
+        [
+            FakeProviderPlugin("openai", ["gpt-4o", "gpt-4o-mini"], available=True),
+            FakeProviderPlugin("openrouter", ["gpt-4o"], available=True),
+        ]
+        if plugins is None
+        else plugins
     )
-    container.register(KeyService, instance=service)
-    container.register(Settings, instance=settings)
-    container.register(ProviderRegistry, instance=provider_registry)
-    app = create_app(container=container, settings=settings)
-    app.state.test_plugin = plugin
-    app.state.test_allocation_store = allocation_store
-    return TestClient(app)
+    resolved_keys = (
+        [
+            ApiKey(
+                id="key-openai",
+                provider="openai",
+                credential={"api_key": "sk-openai"},
+                supported_models=["gpt-4o", "gpt-4o-mini"],
+                last_used_at=datetime.now(timezone.utc),
+            ),
+            ApiKey(
+                id="key-openrouter",
+                provider="openrouter",
+                credential={"api_key": "sk-openrouter"},
+                supported_models=["gpt-4o"],
+                last_used_at=datetime.now(timezone.utc),
+            ),
+        ]
+        if keys is None
+        else keys
+    )
+    repository = InMemoryKeyRepository(resolved_keys)
+    return build_test_client(repository=repository, plugins=resolved_plugins)
+
+
+def test_cross_provider_helper_preserves_explicit_empty_plugins() -> None:
+    client = build_cross_provider_client(plugins=[])
+
+    response = client.get("/api/providers")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_cross_provider_helper_preserves_explicit_empty_keys() -> None:
+    client = build_cross_provider_client(
+        keys=[],
+        plugins=[FakeProviderPlugin("openai", ["gpt-4o"], available=True)],
+    )
+
+    response = client.post(
+        "/api/internal/allocate-key",
+        json={"provider": "openai"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "no_available_key"}
 
 
 def test_allocate_and_report_cycle() -> None:
@@ -65,7 +142,6 @@ def test_allocate_and_report_cycle() -> None:
     )
     assert allocate_response.status_code == 200
     payload = allocate_response.json()
-    assert payload["status"] == "ok"
     assert payload["key_id"] == "key-1"
     assert payload["credential"] == {"api_key": "sk-test"}
 
@@ -75,7 +151,7 @@ def test_allocate_and_report_cycle() -> None:
         headers={"X-Internal-Key": "test-key"},
     )
     assert success_response.status_code == 200
-    assert success_response.json()["key"]["quota_used"] == 12
+    assert success_response.json()["quota_used"] == 12
 
     allocation_store: InMemoryAllocationStore = client.app.state.test_allocation_store
     assert ("openai", "key-1") in allocation_store.released
@@ -93,27 +169,8 @@ def test_allocate_recovers_expired_cooldown_inline() -> None:
             )
         ]
     )
-    allocation_store = InMemoryAllocationStore()
-    scorer = KeyScorer()
-    scheduler = KeyScheduler(scorer, jitter=0.0)
-    state_machine = KeyStateMachine()
     plugin = FakeProviderPlugin("openai", ["gpt-4o"], available=True)
-    provider_registry = build_provider_registry(plugin)
-    service = KeyService(repository, allocation_store, scheduler, scorer, state_machine, provider_registry)
-
-    container = punq.Container()
-    settings = Settings(
-        APP_NAME="KeyFlowTest",
-        API_PREFIX="/api",
-        INTERNAL_API_KEY="test-key",
-        DATABASE_URL_READ="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        DATABASE_URL_WRITE="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        REDIS_URL="redis://localhost:6379/9",
-    )
-    container.register(KeyService, instance=service)
-    container.register(Settings, instance=settings)
-    app = create_app(container=container, settings=settings)
-    client = TestClient(app)
+    client = build_test_client(repository=repository, plugins=[plugin])
 
     response = client.post(
         "/api/internal/allocate-key",
@@ -136,8 +193,7 @@ def test_report_error_accepts_generic_error_type() -> None:
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "ok"
-    assert payload["key"]["status"] == "available"
+    assert payload["status"] == "available"
     allocation_store: InMemoryAllocationStore = client.app.state.test_allocation_store
     assert ("openai", "key-1") in allocation_store.released
 
@@ -186,27 +242,8 @@ def test_allocate_uses_supported_models_local_prefilter() -> None:
             ),
         ]
     )
-    allocation_store = InMemoryAllocationStore()
-    scorer = KeyScorer()
-    scheduler = KeyScheduler(scorer, jitter=0.0)
-    state_machine = KeyStateMachine()
     plugin = FakeProviderPlugin("openai", ["gpt-4o"], available=True)
-    provider_registry = build_provider_registry(plugin)
-    service = KeyService(repository, allocation_store, scheduler, scorer, state_machine, provider_registry)
-
-    container = punq.Container()
-    settings = Settings(
-        APP_NAME="KeyFlowTest",
-        API_PREFIX="/api",
-        INTERNAL_API_KEY="test-key",
-        DATABASE_URL_READ="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        DATABASE_URL_WRITE="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        REDIS_URL="redis://localhost:6379/9",
-    )
-    container.register(KeyService, instance=service)
-    container.register(Settings, instance=settings)
-    app = create_app(container=container, settings=settings)
-    client = TestClient(app)
+    client = build_test_client(repository=repository, plugins=[plugin])
 
     response = client.post(
         "/api/internal/allocate-key",
@@ -216,6 +253,191 @@ def test_allocate_uses_supported_models_local_prefilter() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload["key_id"] == "key-match"
+
+
+def test_allocate_key_route_still_requires_provider() -> None:
+    client = build_client()
+
+    response = client.post(
+        "/api/internal/allocate-key",
+        json={"model": "gpt-4o"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+
+    assert response.status_code == 422
+
+
+def test_allocate_by_model_returns_provider_and_credential() -> None:
+    client = build_client()
+
+    response = client.post(
+        "/api/internal/allocate-by-model",
+        json={"model": "gpt-4o"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "key_id": "key-1",
+        "provider": "openai",
+        "credential": {"api_key": "sk-test"},
+    }
+
+
+def test_allocate_key_remains_provider_scoped_with_cross_provider_route_present() -> None:
+    now = datetime.now(timezone.utc)
+    client = build_cross_provider_client(
+        keys=[
+            ApiKey(
+                id="key-openai",
+                provider="openai",
+                credential={"api_key": "sk-openai"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+            ApiKey(
+                id="key-openrouter",
+                provider="openrouter",
+                credential={"api_key": "sk-openrouter"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+        ],
+        plugins=[
+            FakeProviderPlugin(
+                "openai",
+                ["gpt-4o"],
+                available=True,
+                capacity_signal=CapacitySignal(
+                    has_capacity_signal=True,
+                    capacity_score=0.1,
+                    capacity_kind="remaining_budget_ratio",
+                    reason="lower capacity but correct provider",
+                ),
+            ),
+            FakeProviderPlugin(
+                "openrouter",
+                ["gpt-4o"],
+                available=True,
+                capacity_signal=CapacitySignal(
+                    has_capacity_signal=True,
+                    capacity_score=0.9,
+                    capacity_kind="remaining_budget_ratio",
+                    reason="higher capacity but other provider",
+                ),
+            ),
+        ],
+    )
+
+    response = client.post(
+        "/api/internal/allocate-key",
+        json={"provider": "openai", "model": "gpt-4o"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["key_id"] == "key-openai"
+
+    plugins: dict[str, FakeProviderPlugin] = client.app.state.test_plugins
+    assert plugins["openai"].available_checks == [({"api_key": "sk-openai"}, "gpt-4o")]
+    assert plugins["openrouter"].available_checks == []
+
+
+@pytest.mark.anyio
+async def test_allocate_by_model_passes_ranked_candidates_to_allocation_store() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="openai-low",
+                provider="openai",
+                credential={"api_key": "sk-openai"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+            ApiKey(
+                id="openrouter-high",
+                provider="openrouter",
+                credential={"api_key": "sk-openrouter"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+            ),
+        ]
+    )
+    allocation_store = InMemoryAllocationStore()
+    scorer = KeyScorer()
+    scheduler = KeyScheduler(scorer, jitter=0.0)
+    state_machine = KeyStateMachine()
+    provider_registry = build_provider_registry(
+        FakeProviderPlugin(
+            "openai",
+            ["gpt-4o"],
+            available=True,
+            capacity_signal=CapacitySignal(
+                has_capacity_signal=True,
+                capacity_score=0.1,
+                capacity_kind="remaining_budget_ratio",
+                reason="low capacity",
+            ),
+        ),
+        FakeProviderPlugin(
+            "openrouter",
+            ["gpt-4o"],
+            available=True,
+            capacity_signal=CapacitySignal(
+                has_capacity_signal=True,
+                capacity_score=0.9,
+                capacity_kind="remaining_budget_ratio",
+                reason="high capacity",
+            ),
+        ),
+    )
+    service = KeyService(repository, allocation_store, scheduler, scorer, state_machine, provider_registry)
+
+    selected = await service.allocate_key_by_model("gpt-4o")
+
+    assert selected.id == "openrouter-high"
+    assert allocation_store.any_provider_calls == [
+        {
+            "ordered_candidates": [
+                ("openrouter", "openrouter-high"),
+                ("openai", "openai-low"),
+            ],
+            "lease_seconds": 2,
+        }
+    ]
+
+
+def test_allocate_by_model_returns_404_when_no_key_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = build_client()
+    service: KeyService = client.app.state.container.resolve(KeyService)
+
+    async def _fake_allocate_key_by_model(model: str) -> ApiKey:
+        raise NoAvailableKeyError(f"no available key for {model}")
+
+    monkeypatch.setattr(service, "allocate_key_by_model", _fake_allocate_key_by_model, raising=False)
+
+    response = client.post(
+        "/api/internal/allocate-by-model",
+        json={"model": "gpt-4o"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "no_available_key"}
+
+
+def test_allocate_by_model_returns_404_when_model_not_supported_anywhere() -> None:
+    client = build_cross_provider_client()
+
+    response = client.post(
+        "/api/internal/allocate-by-model",
+        json={"model": "claude-3-opus"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "no_available_key"}
 
 
 def test_allocate_prefers_higher_capacity_signal_when_health_equal() -> None:
@@ -236,10 +458,6 @@ def test_allocate_prefers_higher_capacity_signal_when_health_equal() -> None:
             ),
         ]
     )
-    allocation_store = InMemoryAllocationStore()
-    scorer = KeyScorer()
-    scheduler = KeyScheduler(scorer, jitter=0.0)
-    state_machine = KeyStateMachine()
     plugin = FakeProviderPlugin(
         "openrouter",
         ["gpt-4o"],
@@ -259,23 +477,7 @@ def test_allocate_prefers_higher_capacity_signal_when_health_equal() -> None:
             ),
         },
     )
-    provider_registry = build_provider_registry(plugin)
-    service = KeyService(repository, allocation_store, scheduler, scorer, state_machine, provider_registry)
-
-    container = punq.Container()
-    settings = Settings(
-        APP_NAME="KeyFlowTest",
-        API_PREFIX="/api",
-        INTERNAL_API_KEY="test-key",
-        DATABASE_URL_READ="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        DATABASE_URL_WRITE="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",
-        REDIS_URL="redis://localhost:6379/9",
-    )
-    container.register(KeyService, instance=service)
-    container.register(Settings, instance=settings)
-    container.register(ProviderRegistry, instance=provider_registry)
-    app = create_app(container=container, settings=settings)
-    client = TestClient(app)
+    client = build_test_client(repository=repository, plugins=[plugin])
 
     response = client.post(
         "/api/internal/allocate-key",
@@ -382,20 +584,22 @@ def test_admin_key_crud_and_model_sync() -> None:
         json={"credential": {"api_key": "sk-new"}},
     )
     assert create_response.status_code == 200
-    assert create_response.json() == {"status": "ok"}
+    create_payload = create_response.json()
+    assert create_payload["status"] == "ok"
+    assert "key_id" in create_payload
+    key_id = create_payload["key_id"]
 
     list_response = client.get("/api/providers/openai/keys")
     assert list_response.status_code == 200
     items = list_response.json()
     assert len(items) == 2
     created = next(item for item in items if item["credential"] == {"api_key": "sk-new"})
+    assert created["key_id"] == key_id
     assert created == {
-        "key_id": created["key_id"],
+        "key_id": key_id,
         "credential": {"api_key": "sk-new"},
         "status": "available",
     }
-
-    key_id = created["key_id"]
 
     update_response = client.put(
         f"/api/keys/{key_id}",
@@ -427,6 +631,17 @@ def test_get_key_models_rejects_provider_mismatch() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"detail": "key_not_found"}
+
+
+def test_list_providers_returns_multiple_plugins_with_cross_provider_fixture() -> None:
+    client = build_cross_provider_client()
+
+    response = client.get("/api/providers")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert {item["name"] for item in payload} == {"openai", "openrouter"}
+    assert len(payload) == 2
 
 
 def test_list_providers_returns_plugin_metadata() -> None:

@@ -68,5 +68,22 @@ class RedisKeyCache(KeyAllocationStore):
         )
         return result if isinstance(result, str) and result else None
 
+    async def allocate_key_any_provider(
+        self,
+        ordered_keys: list[ApiKey],
+        now: datetime,
+        lease_seconds: int = 2,
+    ) -> str | None:
+        for key in ordered_keys:
+            allocated_id = await self.allocate_key(
+                key.provider,
+                [key.id],
+                now,
+                lease_seconds=lease_seconds,
+            )
+            if allocated_id is not None:
+                return allocated_id
+        return None
+
     async def release_key_lease(self, provider: str, key_id: str) -> None:
         await self._redis.zrem(self._provider_lease_zset(provider), key_id)

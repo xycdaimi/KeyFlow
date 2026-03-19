@@ -13,9 +13,10 @@
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查，供 Docker / K8s 探活 |
 | `POST` | `/api/internal/allocate-key` | 为指定供应商分配一个当前可用的 Key |
+| `POST` | `/api/internal/allocate-by-model` | 仅按模型名跨 provider 选择当前得分最高的可用 Key |
 | `POST` | `/api/internal/report-error` | 上报一次失败结果，驱动 Key 状态机更新 |
 | `POST` | `/api/internal/report-success` | 上报一次成功结果并累计 token 使用量 |
-| `POST` | `/api/providers/{provider}/keys` | 为某个供应商新增一个凭据，返回成功或失败 |
+| `POST` | `/api/providers/{provider}/keys` | 为某个供应商新增一个凭据，返回成功状态及 `key_id` |
 | `GET` | `/api/providers/{provider}/keys` | 列出某个供应商下的所有 Key，只返回 `key_id`、`credential`、`status` |
 | `GET` | `/api/keys/{key_id}` | 通过 `key_id` 获取凭据内容与状态 |
 | `PUT` | `/api/keys/{key_id}` | 更新某个 Key 的凭据或状态，返回成功或失败 |
@@ -72,13 +73,63 @@ X-Internal-Key: dev-internal-key
 
 ```json
 {
-  "status": "ok",
   "key_id": "key-1",
   "credential": {
     "api_key": "sk-test"
   }
 }
 ```
+
+**常见错误**
+
+- `401`: `{"detail": "invalid internal key"}`
+- `404`: `{"detail": "no_available_key"}`
+
+## 2.1 `POST /api/internal/allocate-by-model`
+
+**功能**
+
+只传模型名，从多个 provider 的候选 Key 中统一筛选并评分，返回当前得分最高且可分配的 Key。
+
+与 `POST /api/internal/allocate-key` 的区别：
+
+- `allocate-key`：调用方先指定 `provider`，系统只在该 provider 内选优
+- `allocate-by-model`：调用方只指定 `model`，系统在所有支持该模型的 provider 中跨 provider 选优
+
+**请求头**
+
+```http
+X-Internal-Key: dev-internal-key
+```
+
+**请求体**
+
+```json
+{
+  "model": "gpt-4o"
+}
+```
+
+字段说明：
+
+- `model`: 必填，目标模型名称；系统会在所有 provider 的 Key 中筛选支持该模型且当前可用的候选
+
+**成功返回示例**
+
+```json
+{
+  "key_id": "key-openrouter",
+  "provider": "openrouter",
+  "credential": {
+    "api_key": "sk-or-best"
+  }
+}
+```
+
+说明：
+
+- `provider`: 本次被选中凭证所属的 provider 名称
+- `credential`: 该 provider 对应的认证凭据内容
 
 **常见错误**
 
@@ -115,19 +166,16 @@ X-Internal-Key: dev-internal-key
 
 ```json
 {
-  "status": "ok",
-  "key": {
-    "id": "key-1",
-    "provider": "openai",
-    "status": "available",
-    "supported_models": [
-      "gpt-4o",
-      "gpt-4o-mini"
-    ],
-    "quota_used": 0,
-    "last_used_at": "2026-03-19T10:00:00Z",
-    "cooldown_until": null
-  }
+  "id": "key-1",
+  "provider": "openai",
+  "status": "available",
+  "supported_models": [
+    "gpt-4o",
+    "gpt-4o-mini"
+  ],
+  "quota_used": 0,
+  "last_used_at": "2026-03-19T10:00:00Z",
+  "cooldown_until": null
 }
 ```
 
@@ -166,19 +214,16 @@ X-Internal-Key: dev-internal-key
 
 ```json
 {
-  "status": "ok",
-  "key": {
-    "id": "key-1",
-    "provider": "openai",
-    "status": "available",
-    "supported_models": [
-      "gpt-4o",
-      "gpt-4o-mini"
-    ],
-    "quota_used": 12,
-    "last_used_at": "2026-03-19T10:00:00Z",
-    "cooldown_until": null
-  }
+  "id": "key-1",
+  "provider": "openai",
+  "status": "available",
+  "supported_models": [
+    "gpt-4o",
+    "gpt-4o-mini"
+  ],
+  "quota_used": 12,
+  "last_used_at": "2026-03-19T10:00:00Z",
+  "cooldown_until": null
 }
 ```
 
@@ -191,7 +236,7 @@ X-Internal-Key: dev-internal-key
 
 **功能**
 
-为指定供应商新增一个凭据账号。创建时会调用对应插件同步支持的模型列表，但接口响应只返回成功或失败状态。
+为指定供应商新增一个凭据账号。创建时会调用对应插件同步支持的模型列表，接口响应返回成功状态及新建 Key 的 `key_id`。
 
 **路径参数**
 
@@ -219,7 +264,8 @@ X-Internal-Key: dev-internal-key
 
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "key_id": "550e8400-e29b-41d4-a716-446655440000"
 }
 ```
 

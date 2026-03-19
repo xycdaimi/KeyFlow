@@ -25,13 +25,23 @@ class KeyResponse(BaseModel):
 
 
 class AllocateResponse(BaseModel):
-    status: str
     key_id: str
+    credential: dict[str, str]
+
+
+class AllocateByModelResponse(BaseModel):
+    key_id: str
+    provider: str
     credential: dict[str, str]
 
 
 class OperationStatusResponse(BaseModel):
     status: str
+
+
+class CreateKeyResponse(BaseModel):
+    status: str
+    key_id: str
 
 
 class AdminKeyListItemResponse(BaseModel):
@@ -47,8 +57,3 @@ class AdminKeyDetailResponse(BaseModel):
 
 class KeyModelsResponse(BaseModel):
     models: list[str]
-
-
-class GenericStatusResponse(BaseModel):
-    status: str
-    key: KeyResponse

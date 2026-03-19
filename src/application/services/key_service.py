@@ -112,23 +112,68 @@ class KeyService:
         now = utcnow()
         provider = provider.strip().lower()
         keys = await self._repository.list_provider_keys(provider)
+        await self._recover_ready_keys(keys, now)
+        candidates, capacity_by_key_id = await self._collect_candidates(keys, model, now)
 
+        ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
+        if not ranked:
+            raise NoAvailableKeyError("no available key")
+
+        ordered_ids = [item.key.id for item in ranked]
+        allocated_id = await self._allocation_store.allocate_key(
+            provider,
+            ordered_ids,
+            now,
+            lease_seconds=self._allocation_lease_seconds,
+        )
+        if allocated_id is None:
+            raise NoAvailableKeyError("no available key")
+
+        return await self._finalize_allocation(ranked, allocated_id, now)
+
+    async def allocate_key_by_model(self, model: str) -> ApiKey:
+        now = utcnow()
+        keys = await self._repository.list_keys()
+        await self._recover_ready_keys(keys, now)
+        candidates, capacity_by_key_id = await self._collect_candidates(keys, model, now)
+
+        ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
+        if not ranked:
+            raise NoAvailableKeyError("no available key")
+
+        allocated_id = await self._allocation_store.allocate_key_any_provider(
+            [item.key for item in ranked],
+            now,
+            lease_seconds=self._allocation_lease_seconds,
+        )
+        if allocated_id is None:
+            raise NoAvailableKeyError("no available key")
+
+        return await self._finalize_allocation(ranked, allocated_id, now)
+
+    async def _recover_ready_keys(self, keys: list[ApiKey], now: datetime) -> None:
         for key in keys:
+            before = key.status
             self._state_machine.recover_if_ready(key, now)
-            if key.status == KeyStatus.AVAILABLE:
+            if before != key.status:
                 await self._repository.upsert_key(key)
 
-        plugin = self._provider_registry.get(provider)
-
-        # Filter: core state + plugin availability signal
+    async def _collect_candidates(
+        self,
+        keys: list[ApiKey],
+        model: str | None,
+        now: datetime,
+    ) -> tuple[list[ApiKey], dict[str, float | None]]:
         candidates: list[ApiKey] = []
         capacity_by_key_id: dict[str, float | None] = {}
+
         for key in keys:
             if not key.is_available(now):
                 continue
-            # Local pre-filter when model capability was synced before.
             if model and key.supported_models and model not in key.supported_models:
                 continue
+
+            plugin = self._provider_registry.get(key.provider)
             if plugin is not None:
                 try:
                     available = await plugin.is_credential_available(key.credential, model)
@@ -145,22 +190,17 @@ class KeyService:
                 capacity_by_key_id[key.id] = None if signal is None else signal.capacity_score
             else:
                 capacity_by_key_id[key.id] = None
+
             candidates.append(key)
 
-        ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
-        if not ranked:
-            raise NoAvailableKeyError("no available key")
+        return candidates, capacity_by_key_id
 
-        ordered_ids = [item.key.id for item in ranked]
-        allocated_id = await self._allocation_store.allocate_key(
-            provider,
-            ordered_ids,
-            now,
-            lease_seconds=self._allocation_lease_seconds,
-        )
-        if allocated_id is None:
-            raise NoAvailableKeyError("no available key")
-
+    async def _finalize_allocation(
+        self,
+        ranked: list,
+        allocated_id: str,
+        now: datetime,
+    ) -> ApiKey:
         selected = next((item.key for item in ranked if item.key.id == allocated_id), None)
         if selected is None:
             selected = await self._get_required_key(allocated_id)

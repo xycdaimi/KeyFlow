@@ -8,6 +8,10 @@ class AllocateRequest(BaseModel):
     model: str | None = None
 
 
+class AllocateByModelRequest(BaseModel):
+    model: str
+
+
 class ReportErrorRequest(BaseModel):
     key_id: str
     error_type: str

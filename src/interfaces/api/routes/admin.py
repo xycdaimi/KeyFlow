@@ -9,6 +9,7 @@ from interfaces.schemas.request import CreateKeyRequest, UpdateKeyRequest
 from interfaces.schemas.response import (
     AdminKeyDetailResponse,
     AdminKeyListItemResponse,
+    CreateKeyResponse,
     KeyModelsResponse,
     OperationStatusResponse,
     ProviderInfoResponse,
@@ -32,14 +33,14 @@ def _to_detail_response(key: ApiKey) -> AdminKeyDetailResponse:
     )
 
 
-@router.post("/providers/{provider}/keys", response_model=OperationStatusResponse)
+@router.post("/providers/{provider}/keys", response_model=CreateKeyResponse)
 async def create_key(
     provider: str,
     payload: CreateKeyRequest,
     service: KeyService = Depends(get_key_service),
-) -> OperationStatusResponse:
-    await service.create_key(CreateKeyInput(provider=provider, credential=payload.credential))
-    return OperationStatusResponse(status="ok")
+) -> CreateKeyResponse:
+    key = await service.create_key(CreateKeyInput(provider=provider, credential=payload.credential))
+    return CreateKeyResponse(status="ok", key_id=key.id)
 
 
 @router.get("/providers/{provider}/keys", response_model=list[AdminKeyListItemResponse])

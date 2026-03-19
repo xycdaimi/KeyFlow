@@ -7,8 +7,8 @@ from domain.exceptions.domain_exceptions import NoAvailableKeyError
 from infrastructure.config.settings import Settings
 from interfaces.api.deps import get_key_service, get_settings
 from interfaces.middleware.auth import verify_internal_key
-from interfaces.schemas.request import AllocateRequest
-from interfaces.schemas.response import AllocateResponse
+from interfaces.schemas.request import AllocateByModelRequest, AllocateRequest
+from interfaces.schemas.response import AllocateByModelResponse, AllocateResponse
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -30,7 +30,29 @@ async def allocate_key(
         ) from exc
 
     return AllocateResponse(
-        status="ok",
         key_id=key.id,
+        credential=key.credential,
+    )
+
+
+@router.post("/allocate-by-model", response_model=AllocateByModelResponse)
+async def allocate_key_by_model(
+    payload: AllocateByModelRequest,
+    x_internal_key: Annotated[str | None, Header()] = None,
+    service: KeyService = Depends(get_key_service),
+    settings: Settings = Depends(get_settings),
+) -> AllocateByModelResponse:
+    await verify_internal_key(settings, x_internal_key)
+    try:
+        key = await service.allocate_key_by_model(payload.model)
+    except NoAvailableKeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="no_available_key",
+        ) from exc
+
+    return AllocateByModelResponse(
+        key_id=key.id,
+        provider=key.provider,
         credential=key.credential,
     )

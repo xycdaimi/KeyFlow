@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from domain.entities.api_key import ApiKey
 from infrastructure.plugins.base import CapacitySignal, ProviderPlugin, ProviderRegistry
@@ -40,12 +40,25 @@ class InMemoryAllocationStore:
     def __init__(self) -> None:
         self.synced_scores: dict[str, float] = {}
         self.released: list[tuple[str, str]] = []
+        self.allocate_calls: list[tuple[str, list[str]]] = []
+        self.any_provider_calls: list[dict[str, object]] = []
+        self.any_provider_ordered_ids: list[str] = []
+        self.removed_keys: set[tuple[str, str]] = set()
+        self.active_leases: dict[tuple[str, str], datetime] = {}
 
     async def sync_key(self, key: ApiKey, score: float) -> None:
         self.synced_scores[key.id] = score
+        self.removed_keys.discard((key.provider, key.id))
 
     async def remove_key(self, key_id: str, provider: str) -> None:
         self.synced_scores.pop(key_id, None)
+        self.removed_keys.add((provider, key_id))
+        self.active_leases.pop((provider, key_id), None)
+
+    def _prune_expired_leases(self, now: datetime) -> None:
+        expired = [lease_key for lease_key, expires_at in self.active_leases.items() if expires_at <= now]
+        for lease_key in expired:
+            self.active_leases.pop(lease_key, None)
 
     async def allocate_key(
         self,
@@ -54,12 +67,47 @@ class InMemoryAllocationStore:
         now: datetime,
         lease_seconds: int = 2,
     ) -> str | None:
-        if not ordered_key_ids:
-            return None
-        return ordered_key_ids[0]
+        self.allocate_calls.append((provider, list(ordered_key_ids)))
+        self._prune_expired_leases(now)
+        for key_id in ordered_key_ids:
+            lease_key = (provider, key_id)
+            if lease_key in self.removed_keys or lease_key in self.active_leases:
+                continue
+            self.active_leases[lease_key] = now + timedelta(seconds=max(lease_seconds, 1))
+            return key_id
+        return None
+
+    async def allocate_key_any_provider(
+        self,
+        ordered_keys: list[ApiKey],
+        now: datetime,
+        lease_seconds: int = 2,
+    ) -> str | None:
+        self.any_provider_calls.append(
+            {
+                "ordered_candidates": [(key.provider, key.id) for key in ordered_keys],
+                "lease_seconds": lease_seconds,
+            }
+        )
+        self.any_provider_ordered_ids = [key.id for key in ordered_keys]
+        for key in ordered_keys:
+            allocated_id = await self.allocate_key(
+                key.provider,
+                [key.id],
+                now,
+                lease_seconds=lease_seconds,
+            )
+            if allocated_id is not None:
+                return allocated_id
+        return None
 
     async def release_key_lease(self, provider: str, key_id: str) -> None:
         self.released.append((provider, key_id))
+        self.active_leases.pop((provider, key_id), None)
+
+
+class InMemoryAnyProviderAllocationStore(InMemoryAllocationStore):
+    pass
 
 
 class FakeProviderPlugin(ProviderPlugin):

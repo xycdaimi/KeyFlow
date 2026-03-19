@@ -42,5 +42,13 @@ class KeyAllocationStore(Protocol):
     ) -> str | None:
         ...
 
+    async def allocate_key_any_provider(
+        self,
+        ordered_keys: list[ApiKey],
+        now: datetime,
+        lease_seconds: int = 2,
+    ) -> str | None:
+        ...
+
     async def release_key_lease(self, provider: str, key_id: str) -> None:
         ...
