@@ -156,3 +156,45 @@ async def test_recover_cooldowns_is_safe_to_call_more_than_once() -> None:
     assert second == 0
     assert repository._keys["key-1"].status == KeyStatus.AVAILABLE
     assert repository._keys["key-1"].cooldown_until is None
+
+
+@pytest.mark.anyio
+async def test_refresh_keys_retries_fetch_models_for_fetch_models_failed_key() -> None:
+    now = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    class _RetryFetchModelsPlugin(FakeProviderPlugin):
+        def __init__(self) -> None:
+            super().__init__("openai", ["gpt-4o"], available=True)
+            self.fetch_attempts = 1
+
+        async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+            self.fetch_attempts += 1
+            if self.fetch_attempts == 1:
+                raise RuntimeError("temporary model sync failure")
+            return ["gpt-4o"]
+
+    plugin = _RetryFetchModelsPlugin()
+    service, repository = build_key_service(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.DISABLED,
+                disabled_reason="fetch_models_failed",
+                supported_models=[],
+                last_refreshed_at=now,
+                cached_available=False,
+            )
+        ],
+        plugin,
+    )
+
+    refreshed = await service.refresh_keys()
+
+    assert refreshed == 1
+    assert plugin.fetch_attempts == 2
+    assert repository._keys["key-1"].status == KeyStatus.AVAILABLE
+    assert repository._keys["key-1"].disabled_reason is None
+    assert repository._keys["key-1"].supported_models == ["gpt-4o"]
+    assert repository._keys["key-1"].cached_available is True

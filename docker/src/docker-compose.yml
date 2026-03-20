@@ -38,6 +38,9 @@ services:
     build:
       context: ../..
       dockerfile: docker/src/Dockerfile
+    depends_on:
+      keyflow-api:
+        condition: service_healthy
     command: ["python", "src/worker_main.py"]
     env_file:
       - ../../.env

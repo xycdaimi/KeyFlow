@@ -414,6 +414,40 @@ async def test_update_key_rejects_duplicate_credential_within_same_provider() ->
 
 
 @pytest.mark.anyio
+async def test_update_key_clears_models_and_disables_key_when_fetch_models_fails() -> None:
+    class _FetchModelsFailPlugin(FakeProviderPlugin):
+        async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+            raise RuntimeError("models unavailable")
+
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-old"},
+                supported_models=["gpt-4o", "gpt-4o-mini"],
+                status=KeyStatus.AVAILABLE,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(_FetchModelsFailPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    updated = await service.update_key("key-1", UpdateKeyInput(credential={"api_key": "sk-new"}))
+
+    assert updated.supported_models == []
+    assert updated.status == KeyStatus.DISABLED
+    assert repository._keys["key-1"].supported_models == []
+    assert repository._keys["key-1"].status == KeyStatus.DISABLED
+
+
+@pytest.mark.anyio
 async def test_in_memory_allocation_store_skips_removed_keys() -> None:
     store = InMemoryAllocationStore()
     now = datetime.now(timezone.utc)

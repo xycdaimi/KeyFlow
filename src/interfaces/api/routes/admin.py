@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from application.services.key_service import CreateKeyInput, KeyService, UpdateKeyInput
 from domain.entities.api_key import ApiKey
@@ -8,8 +10,10 @@ from domain.exceptions.domain_exceptions import (
     ProviderNotFoundError,
     ProviderNotReadyError,
 )
+from infrastructure.config.settings import Settings
 from infrastructure.plugins.base import ProviderRegistry
-from interfaces.api.deps import get_key_service, get_provider_registry
+from interfaces.api.deps import get_key_service, get_provider_registry, get_settings
+from interfaces.middleware.auth import verify_internal_key
 from interfaces.schemas.request import CreateKeyRequest, UpdateKeyRequest
 from interfaces.schemas.response import (
     AdminKeyDetailResponse,
@@ -20,7 +24,15 @@ from interfaces.schemas.response import (
     ProviderInfoResponse,
 )
 
-router = APIRouter(tags=["admin"])
+
+async def require_admin_internal_key(
+    x_internal_key: Annotated[str | None, Header()] = None,
+    settings: Settings = Depends(get_settings),
+) -> None:
+    await verify_internal_key(settings, x_internal_key)
+
+
+router = APIRouter(tags=["admin"], dependencies=[Depends(require_admin_internal_key)])
 
 
 def _to_list_item_response(key: ApiKey) -> AdminKeyListItemResponse:

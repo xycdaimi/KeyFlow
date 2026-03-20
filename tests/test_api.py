@@ -36,6 +36,7 @@ def build_settings() -> Settings:
 
 
 HealthCheckFn = Callable[[], Awaitable[tuple[bool, str | None]]]
+ADMIN_HEADERS = {"X-Internal-Key": "test-key"}
 
 
 def build_test_client(
@@ -203,7 +204,7 @@ def test_health_returns_503_degraded_when_dependency_fails() -> None:
 def test_cross_provider_helper_preserves_explicit_empty_plugins() -> None:
     client = build_cross_provider_client(plugins=[])
 
-    response = client.get("/api/providers")
+    response = client.get("/api/providers", headers=ADMIN_HEADERS)
 
     assert response.status_code == 200
     assert response.json() == []
@@ -863,6 +864,7 @@ def test_admin_key_crud_and_model_sync() -> None:
     create_response = client.post(
         "/api/providers/openai/keys",
         json={"credential": {"api_key": "sk-new"}},
+        headers=ADMIN_HEADERS,
     )
     assert create_response.status_code == 200
     create_payload = create_response.json()
@@ -870,7 +872,7 @@ def test_admin_key_crud_and_model_sync() -> None:
     assert "key_id" in create_payload
     key_id = create_payload["key_id"]
 
-    list_response = client.get("/api/providers/openai/keys")
+    list_response = client.get("/api/providers/openai/keys", headers=ADMIN_HEADERS)
     assert list_response.status_code == 200
     items = list_response.json()
     assert len(items) == 2
@@ -885,24 +887,34 @@ def test_admin_key_crud_and_model_sync() -> None:
     update_response = client.put(
         f"/api/keys/{key_id}",
         json={"credential": {"api_key": "sk-updated"}},
+        headers=ADMIN_HEADERS,
     )
     assert update_response.status_code == 200
     assert update_response.json() == {"status": "ok"}
 
-    get_key_response = client.get(f"/api/keys/{key_id}")
+    get_key_response = client.get(f"/api/keys/{key_id}", headers=ADMIN_HEADERS)
     assert get_key_response.status_code == 200
     assert get_key_response.json() == {
         "credential": {"api_key": "sk-updated"},
         "status": "available",
     }
 
-    get_models_response = client.get(f"/api/providers/openai/keys/{key_id}/models")
+    get_models_response = client.get(f"/api/providers/openai/keys/{key_id}/models", headers=ADMIN_HEADERS)
     assert get_models_response.status_code == 200
     assert get_models_response.json() == {"models": ["gpt-4o", "gpt-4o-mini"]}
 
-    delete_response = client.delete(f"/api/keys/{key_id}")
+    delete_response = client.delete(f"/api/keys/{key_id}", headers=ADMIN_HEADERS)
     assert delete_response.status_code == 200
     assert delete_response.json() == {"status": "ok"}
+
+
+def test_admin_routes_require_internal_key() -> None:
+    client = build_client()
+
+    response = client.get("/api/providers")
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "invalid internal key"}
 
 
 def test_create_key_rejects_duplicate_credential_within_same_provider() -> None:
@@ -911,6 +923,7 @@ def test_create_key_rejects_duplicate_credential_within_same_provider() -> None:
     response = client.post(
         "/api/providers/openai/keys",
         json={"credential": {"api_key": "sk-test"}},
+        headers=ADMIN_HEADERS,
     )
 
     assert response.status_code == 409
@@ -923,6 +936,7 @@ def test_create_key_rejects_unknown_provider() -> None:
     response = client.post(
         "/api/providers/missing/keys",
         json={"credential": {"api_key": "sk-test"}},
+        headers=ADMIN_HEADERS,
     )
 
     assert response.status_code == 404
@@ -937,6 +951,7 @@ def test_create_key_rejects_provider_that_is_not_ready() -> None:
     response = client.post(
         "/api/providers/gemini-web-proxy/keys",
         json={"credential": {"secure_1psid": "a", "secure_1psidts": "b"}},
+        headers=ADMIN_HEADERS,
     )
 
     assert response.status_code == 409
@@ -969,6 +984,7 @@ def test_update_key_rejects_duplicate_credential_within_same_provider() -> None:
     response = client.put(
         "/api/keys/key-b",
         json={"credential": {"api_key": "sk-a"}},
+        headers=ADMIN_HEADERS,
     )
 
     assert response.status_code == 409
@@ -978,7 +994,7 @@ def test_update_key_rejects_duplicate_credential_within_same_provider() -> None:
 def test_get_key_models_rejects_provider_mismatch() -> None:
     client = build_client()
 
-    response = client.get("/api/providers/anthropic/keys/key-1/models")
+    response = client.get("/api/providers/anthropic/keys/key-1/models", headers=ADMIN_HEADERS)
 
     assert response.status_code == 404
     assert response.json() == {"detail": "key_not_found"}
@@ -987,7 +1003,7 @@ def test_get_key_models_rejects_provider_mismatch() -> None:
 def test_list_providers_returns_multiple_plugins_with_cross_provider_fixture() -> None:
     client = build_cross_provider_client()
 
-    response = client.get("/api/providers")
+    response = client.get("/api/providers", headers=ADMIN_HEADERS)
 
     assert response.status_code == 200
     payload = response.json()
@@ -998,7 +1014,7 @@ def test_list_providers_returns_multiple_plugins_with_cross_provider_fixture() -
 def test_list_providers_returns_plugin_metadata() -> None:
     client = build_client()
 
-    response = client.get("/api/providers")
+    response = client.get("/api/providers", headers=ADMIN_HEADERS)
 
     assert response.status_code == 200
     payload = response.json()
@@ -1012,7 +1028,7 @@ def test_list_providers_returns_plugin_metadata() -> None:
 def test_explain_key_returns_safe_plugin_summary() -> None:
     client = build_client()
 
-    response = client.get("/api/keys/key-1/explain")
+    response = client.get("/api/keys/key-1/explain", headers=ADMIN_HEADERS)
 
     assert response.status_code == 200
     payload = response.json()

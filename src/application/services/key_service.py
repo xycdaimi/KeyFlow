@@ -294,6 +294,14 @@ class KeyService:
                 await self._repository.upsert_key(key)
                 refreshed += 1
                 continue
+            if key.disabled_reason == "fetch_models_failed":
+                await self._sync_models(key, plugin=plugin)
+                if key.disabled_reason == "fetch_models_failed":
+                    key.last_refreshed_at = now
+                    await self._repository.upsert_key(key)
+                    await self._allocation_store.sync_key(key, self._scorer.score(key, now))
+                    refreshed += 1
+                    continue
             try:
                 available = await plugin.is_credential_available(key.credential, model)
             except Exception as exc:
@@ -346,7 +354,14 @@ class KeyService:
             return
         try:
             key.supported_models = await plugin.fetch_models(key.credential)
+            if key.status == KeyStatus.DISABLED and key.disabled_reason == "fetch_models_failed":
+                key.status = KeyStatus.AVAILABLE
+                key.disabled_reason = None
         except Exception as exc:
+            key.supported_models = []
+            key.status = KeyStatus.DISABLED
+            key.disabled_reason = "fetch_models_failed"
+            key.cached_available = False
             logger.warning("fetch_models failed for %s: %s", key.id, exc)
 
     def _require_ready_provider(self, provider: str):
