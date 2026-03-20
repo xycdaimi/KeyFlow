@@ -1,0 +1,95 @@
+<mxfile host="65bd71144e">
+    <diagram id="tT_EgfvHdZ4fwfc0uLNn" name="第 1 页">
+        <mxGraphModel dx="1048" dy="911" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="upstream" value="Upstream Services&#10;&#10;Internal callers&#10;Gateway / scheduler / app services" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=16;fontStyle=1;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="30" y="220" width="200" height="110" as="geometry"/>
+                </mxCell>
+                <mxCell id="pod" value="KeyFlow Runtime&#10;same Pod, two containers" style="swimlane;whiteSpace=wrap;html=1;rounded=1;container=1;horizontal=1;startSize=36;fillColor=#f5f5f5;strokeColor=#666666;fontSize=18;fontStyle=1;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="290" y="100" width="640" height="360" as="geometry"/>
+                </mxCell>
+                <mxCell id="api" value="keyflow-api&#10;&#10;FastAPI&#10;allocate / report / admin / health" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=16;fontStyle=1;fontColor=#111111;" parent="pod" vertex="1">
+                    <mxGeometry x="40" y="80" width="230" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="worker" value="keyflow-worker&#10;&#10;Sidecar worker&#10;recover_cooldowns / refresh_keys" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=16;fontStyle=1;fontColor=#111111;" parent="pod" vertex="1">
+                    <mxGeometry x="370" y="80" width="230" height="120" as="geometry"/>
+                </mxCell>
+                <mxCell id="podnote" value="Stateless worker and API share the same sources of truth&#10;through PostgreSQL and Redis." style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#ffffff;strokeColor=#999999;fontSize=14;fontColor=#111111;" parent="pod" vertex="1">
+                    <mxGeometry x="130" y="240" width="360" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="providers" value="Provider APIs&#10;&#10;OpenAI / Anthropic / Gemini / OpenRouter / Gemini Web Proxy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=16;fontStyle=1;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="1010" y="210" width="260" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="postgres" value="PostgreSQL&#10;&#10;Key metadata&#10;status / models / refresh timestamps" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=15;fontStyle=1;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="390" y="540" width="210" height="140" as="geometry"/>
+                </mxCell>
+                <mxCell id="redis" value="Redis + Lua&#10;&#10;Atomic allocation&#10;lease / score sync / cooldown cache" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=15;fontStyle=1;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="660" y="540" width="220" height="130" as="geometry"/>
+                </mxCell>
+                <mxCell id="redisnote" value="Redis + Lua atomic allocation" style="shape=note;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=14;fontColor=#111111;" parent="1" vertex="1">
+                    <mxGeometry x="680" y="690" width="180" height="70" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" value="allocate / report / admin / health" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="upstream" target="api" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="260" y="275"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e2" value="metadata persistence" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="api" target="postgres" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="445" y="440"/>
+                            <mxPoint x="445" y="500"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e3" value="allocate lease / sync score" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="api" target="redis" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="620" y="440"/>
+                            <mxPoint x="620" y="500"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e4" value="load / update recoverable keys" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="worker" target="postgres" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="735" y="430"/>
+                            <mxPoint x="520" y="430"/>
+                            <mxPoint x="520" y="500"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e5" value="refresh cache / sync score" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="worker" target="redis" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="775" y="440"/>
+                            <mxPoint x="775" y="500"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e6" value="availability / capacity / models refresh" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeWidth=2;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="worker" target="providers" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="960" y="240"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e7" value="create / update key sync" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#82b366;html=1;strokeWidth=2;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="api" target="providers" edge="1">
+                    <mxGeometry relative="1" as="geometry">
+                        <Array as="points">
+                            <mxPoint x="940" y="160"/>
+                            <mxPoint x="940" y="210"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e8" value="shared truth sources" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;dashed=1;strokeColor=#999999;endArrow=none;startArrow=none;fontColor=#111111;labelBackgroundColor=#ffffff;" parent="1" source="postgres" target="redis" edge="1">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>
