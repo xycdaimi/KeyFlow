@@ -10,6 +10,8 @@ from domain.exceptions.domain_exceptions import (
     DuplicateCredentialError,
     KeyNotFoundError,
     NoAvailableKeyError,
+    ProviderNotFoundError,
+    ProviderNotReadyError,
 )
 from domain.repositories.key_repository import KeyAllocationStore, KeyRepository
 from domain.services.scheduler import KeyScheduler
@@ -65,6 +67,7 @@ class KeyService:
     async def create_key(self, data: CreateKeyInput) -> ApiKey:
         now = utcnow()
         provider = data.provider.strip().lower()
+        plugin = self._require_ready_provider(provider)
         existing = await self._repository.get_by_provider_credential(provider, data.credential)
         if existing is not None:
             raise DuplicateCredentialError(
@@ -75,8 +78,8 @@ class KeyService:
             provider=provider,
             credential=data.credential,
         )
-        await self._sync_models(key)
-        await self._refresh_single_key(key, now)
+        await self._sync_models(key, plugin=plugin)
+        await self._refresh_single_key(key, now, plugin=plugin)
         await self._repository.upsert_key(key)
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
         return key
@@ -84,6 +87,7 @@ class KeyService:
     async def update_key(self, key_id: str, data: UpdateKeyInput) -> ApiKey:
         key = await self._get_required_key(key_id)
         if data.credential is not None:
+            plugin = self._require_ready_provider(key.provider)
             existing = await self._repository.get_by_provider_credential(
                 key.provider, data.credential
             )
@@ -92,8 +96,8 @@ class KeyService:
                     f"credential already exists for provider {key.provider} (key_id={existing.id})"
                 )
             key.credential = data.credential
-            await self._sync_models(key)
-            await self._refresh_single_key(key, utcnow())
+            await self._sync_models(key, plugin=plugin)
+            await self._refresh_single_key(key, utcnow(), plugin=plugin)
         if data.status is not None:
             key.status = data.status
         await self._repository.upsert_key(key)
@@ -308,9 +312,9 @@ class KeyService:
             refreshed += 1
         return refreshed
 
-    async def _refresh_single_key(self, key: ApiKey, now: datetime) -> None:
+    async def _refresh_single_key(self, key: ApiKey, now: datetime, plugin=None) -> None:
         """Refresh one key's cached_available and cached_capacity_score (no claim)."""
-        plugin = self._provider_registry.get(key.provider)
+        plugin = plugin or self._provider_registry.get(key.provider)
         if plugin is None:
             key.last_refreshed_at = now
             key.cached_available = True
@@ -335,12 +339,20 @@ class KeyService:
             raise KeyNotFoundError(f"key {key_id} not found")
         return key
 
-    async def _sync_models(self, key: ApiKey) -> None:
+    async def _sync_models(self, key: ApiKey, plugin=None) -> None:
         """Fetch and store the supported model list from the plugin."""
-        plugin = self._provider_registry.get(key.provider)
+        plugin = plugin or self._provider_registry.get(key.provider)
         if plugin is None:
             return
         try:
             key.supported_models = await plugin.fetch_models(key.credential)
         except Exception as exc:
             logger.warning("fetch_models failed for %s: %s", key.id, exc)
+
+    def _require_ready_provider(self, provider: str):
+        plugin = self._provider_registry.get(provider)
+        if plugin is None:
+            raise ProviderNotFoundError(f"provider {provider} is not registered")
+        if not plugin.is_plugin_ready():
+            raise ProviderNotReadyError(f"provider {provider} is not ready")
+        return plugin

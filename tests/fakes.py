@@ -156,12 +156,14 @@ class FakeProviderPlugin(ProviderPlugin):
         name: str,
         models: list[str] | None = None,
         available: bool = True,
+        plugin_ready: bool = True,
         capacity_signal: CapacitySignal | None = None,
         capacity_by_credential: dict[tuple[tuple[str, str], ...], CapacitySignal | None] | None = None,
     ) -> None:
         self._name = name
         self._models = models or []
         self._available = available
+        self._plugin_ready = plugin_ready
         self._capacity_signal = capacity_signal
         self._capacity_by_credential = capacity_by_credential or {}
         self.success_calls: list[tuple[dict[str, str], dict]] = []
@@ -183,6 +185,9 @@ class FakeProviderPlugin(ProviderPlugin):
     @property
     def credential_hint(self) -> str:
         return '{"api_key": "sk-***"}'
+
+    def is_plugin_ready(self) -> bool:
+        return self._plugin_ready
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         return self._models

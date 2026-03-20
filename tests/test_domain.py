@@ -5,7 +5,11 @@ import pytest
 
 from application.services.key_service import CreateKeyInput, KeyService, UpdateKeyInput
 from domain.entities.api_key import ApiKey
-from domain.exceptions.domain_exceptions import DuplicateCredentialError
+from domain.exceptions.domain_exceptions import (
+    DuplicateCredentialError,
+    ProviderNotFoundError,
+    ProviderNotReadyError,
+)
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer, ScoreWeights
 from domain.services.state_machine import KeyStateMachine
@@ -341,6 +345,43 @@ async def test_create_key_rejects_duplicate_credential_within_same_provider() ->
 
     with pytest.raises(DuplicateCredentialError):
         await service.create_key(CreateKeyInput(provider="openai", credential={"api_key": "sk-same"}))
+
+
+@pytest.mark.anyio
+async def test_create_key_rejects_unknown_provider() -> None:
+    service = KeyService(
+        InMemoryKeyRepository(),
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    with pytest.raises(ProviderNotFoundError):
+        await service.create_key(CreateKeyInput(provider="missing", credential={"api_key": "sk-missing"}))
+
+
+@pytest.mark.anyio
+async def test_create_key_rejects_provider_that_is_not_ready() -> None:
+    service = KeyService(
+        InMemoryKeyRepository(),
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(
+            FakeProviderPlugin("gemini-web-proxy", ["gemini-2.5-pro"], available=True, plugin_ready=False)
+        ),
+    )
+
+    with pytest.raises(ProviderNotReadyError):
+        await service.create_key(
+            CreateKeyInput(
+                provider="gemini-web-proxy",
+                credential={"secure_1psid": "a", "secure_1psidts": "b"},
+            )
+        )
 
 
 @pytest.mark.anyio

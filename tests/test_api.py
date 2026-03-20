@@ -669,6 +669,32 @@ def test_create_key_rejects_duplicate_credential_within_same_provider() -> None:
     assert response.json() == {"detail": "duplicate_credential"}
 
 
+def test_create_key_rejects_unknown_provider() -> None:
+    client = build_client()
+
+    response = client.post(
+        "/api/providers/missing/keys",
+        json={"credential": {"api_key": "sk-test"}},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "provider_not_found"}
+
+
+def test_create_key_rejects_provider_that_is_not_ready() -> None:
+    repository = InMemoryKeyRepository()
+    plugin = FakeProviderPlugin("gemini-web-proxy", ["gemini-2.5-pro"], available=True, plugin_ready=False)
+    client = build_test_client(repository=repository, plugins=[plugin])
+
+    response = client.post(
+        "/api/providers/gemini-web-proxy/keys",
+        json={"credential": {"secure_1psid": "a", "secure_1psidts": "b"}},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "provider_not_ready"}
+
+
 def test_update_key_rejects_duplicate_credential_within_same_provider() -> None:
     now = datetime.now(timezone.utc)
     repository = InMemoryKeyRepository(
