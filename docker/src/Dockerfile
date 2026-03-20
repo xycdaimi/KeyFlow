@@ -13,4 +13,5 @@ RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUST
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir src --workers ${UVICORN_WORKERS:-4}"]
+# Shared image for both API and worker runtimes.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir src --workers ${UVICORN_WORKERS:-1}"]

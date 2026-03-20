@@ -1,4 +1,9 @@
+import asyncio
+import inspect
+import logging
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 import punq
@@ -12,6 +17,7 @@ from domain.services.scorer import KeyScorer
 from domain.services.state_machine import KeyStateMachine
 from domain.value_objects.key_status import KeyStatus
 from infrastructure.config.settings import Settings
+from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
 from infrastructure.plugins.base import CapacitySignal, ProviderRegistry
 from interfaces.api import app as api_app_module
 from interfaces.api.app import create_app, ensure_schema_ready
@@ -29,11 +35,15 @@ def build_settings() -> Settings:
     )
 
 
+HealthCheckFn = Callable[[], Awaitable[tuple[bool, str | None]]]
+
+
 def build_test_client(
     *,
     repository: InMemoryKeyRepository,
     plugins: list[FakeProviderPlugin],
     allocation_store: InMemoryAllocationStore | None = None,
+    health_checkers: dict[str, HealthCheckFn] | None = None,
 ) -> TestClient:
     resolved_allocation_store = allocation_store or InMemoryAllocationStore()
     scorer = KeyScorer()
@@ -52,6 +62,8 @@ def build_test_client(
     app.state.test_plugins = {plugin.name: plugin for plugin in plugins}
     if len(plugins) == 1:
         app.state.test_plugin = plugins[0]
+    if health_checkers is not None:
+        app.state.health_checkers = health_checkers
     return TestClient(app)
 
 
@@ -116,6 +128,76 @@ def build_cross_provider_client(
     )
     repository = InMemoryKeyRepository(resolved_keys)
     return build_test_client(repository=repository, plugins=resolved_plugins)
+
+
+def test_health_reports_ready_when_dependencies_ok() -> None:
+    async def check_app() -> tuple[bool, str | None]:
+        return True, None
+
+    async def check_database() -> tuple[bool, str | None]:
+        return True, None
+
+    async def check_redis() -> tuple[bool, str | None]:
+        return True, None
+
+    repository = InMemoryKeyRepository([])
+    plugin = FakeProviderPlugin("openai", ["gpt-4o"], available=True)
+    client = build_test_client(
+        repository=repository,
+        plugins=[plugin],
+        health_checkers={
+            "app": check_app,
+            "database": check_database,
+            "redis": check_redis,
+        },
+    )
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "checks": {
+            "app": {"status": "ok", "detail": None},
+            "database": {"status": "ok", "detail": None},
+            "redis": {"status": "ok", "detail": None},
+        },
+    }
+
+
+def test_health_returns_503_degraded_when_dependency_fails() -> None:
+    async def check_app() -> tuple[bool, str | None]:
+        return True, None
+
+    async def check_database() -> tuple[bool, str | None]:
+        return False, "connection refused"
+
+    async def check_redis() -> tuple[bool, str | None]:
+        return True, None
+
+    repository = InMemoryKeyRepository([])
+    plugin = FakeProviderPlugin("openai", ["gpt-4o"], available=True)
+    client = build_test_client(
+        repository=repository,
+        plugins=[plugin],
+        health_checkers={
+            "app": check_app,
+            "database": check_database,
+            "redis": check_redis,
+        },
+    )
+
+    response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "status": "degraded",
+        "checks": {
+            "app": {"status": "ok", "detail": None},
+            "database": {"status": "error", "detail": "connection refused"},
+            "redis": {"status": "ok", "detail": None},
+        },
+    }
 
 
 def test_cross_provider_helper_preserves_explicit_empty_plugins() -> None:
@@ -607,6 +689,172 @@ async def test_ensure_schema_ready_raises_after_retry_budget(monkeypatch: pytest
         await ensure_schema_ready(_FakeEngine())
 
     assert attempts == 3
+
+
+@pytest.mark.anyio
+async def test_lifespan_skips_runtime_startup_when_dependencies_missing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="interfaces.api.app")
+
+    class _MissingContainer:
+        def resolve(self, dependency):
+            raise punq.MissingDependencyError(f"missing {dependency}")
+
+    app = SimpleNamespace(state=SimpleNamespace(container=_MissingContainer()))
+
+    async with api_app_module.lifespan(app):
+        pass
+
+    assert "event=lifespan_runtime_dependencies_missing" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_lifespan_reraises_unexpected_resolution_errors() -> None:
+    class _BoomContainer:
+        def resolve(self, dependency):
+            if dependency is SqlAlchemyKeyRepository:
+                raise RuntimeError("unexpected resolution failure")
+            raise AssertionError("unexpected dependency lookup")
+
+    app = SimpleNamespace(state=SimpleNamespace(container=_BoomContainer()))
+
+    with pytest.raises(RuntimeError, match="unexpected resolution failure"):
+        async with api_app_module.lifespan(app):
+            pass
+
+
+@pytest.mark.anyio
+async def test_api_lifespan_does_not_start_background_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    called = False
+
+    async def _fake_ensure_schema_ready(_engine) -> None:
+        return None
+
+    async def _fake_ensure_refresh_columns(_conn) -> None:
+        return None
+
+    class _FakeTask:
+        def cancel(self) -> None:
+            return None
+
+        def __await__(self):
+            async def _noop() -> None:
+                return None
+
+            return _noop().__await__()
+
+    def _fake_create_task(coro):
+        nonlocal called
+        called = True
+        if inspect.iscoroutine(coro):
+            coro.close()
+        return _FakeTask()
+
+    class _FakeConnection:
+        pass
+
+    class _FakeBegin:
+        async def __aenter__(self) -> _FakeConnection:
+            return _FakeConnection()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _FakeEngine:
+        def begin(self) -> _FakeBegin:
+            return _FakeBegin()
+
+        async def dispose(self) -> None:
+            return None
+
+    class _FakeFactory:
+        def __init__(self, engine: _FakeEngine) -> None:
+            self.kw = {"bind": engine}
+
+    class _FakeRepository:
+        def __init__(self) -> None:
+            engine = _FakeEngine()
+            self._write_factory = _FakeFactory(engine)
+            self._read_factory = _FakeFactory(engine)
+
+    class _FakeRedis:
+        async def aclose(self) -> None:
+            return None
+
+    class _FakeRedisCache:
+        def __init__(self) -> None:
+            self._redis = _FakeRedis()
+
+    class _FakeKeyService:
+        pass
+
+    class _FakeSettings:
+        background_task_interval_seconds = 23
+
+    class _Container:
+        def __init__(self) -> None:
+            self._repository = _FakeRepository()
+            self._cache = _FakeRedisCache()
+            self._service = _FakeKeyService()
+            self._settings = _FakeSettings()
+
+        def resolve(self, dependency):
+            if dependency is SqlAlchemyKeyRepository:
+                return self._repository
+            if dependency.__name__ == "RedisKeyCache":
+                return self._cache
+            if dependency is KeyService:
+                return self._service
+            if dependency is Settings:
+                return self._settings
+            raise AssertionError(f"unexpected dependency lookup: {dependency}")
+
+    monkeypatch.setattr(api_app_module, "ensure_schema_ready", _fake_ensure_schema_ready)
+    monkeypatch.setattr(api_app_module, "ensure_refresh_columns", _fake_ensure_refresh_columns)
+    monkeypatch.setattr(api_app_module.asyncio, "create_task", _fake_create_task)
+
+    app = SimpleNamespace(state=SimpleNamespace(container=_Container()))
+
+    async with api_app_module.lifespan(app):
+        pass
+
+    assert called is False
+
+
+@pytest.mark.anyio
+async def test_background_phase_failure_logs_phase_continues_loop_and_other_phase(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One phase failing logs phase name; same iteration still runs the other phase; loop continues."""
+    from interfaces.workers.background import run_worker_loop
+
+    caplog.set_level(logging.WARNING, logger="interfaces.workers.background")
+
+    class _BgKeyService:
+        def __init__(self) -> None:
+            self.recover_calls = 0
+            self.refresh_calls = 0
+
+        async def recover_cooldowns(self) -> int:
+            self.recover_calls += 1
+            raise RuntimeError("recover failed")
+
+        async def refresh_keys(self) -> int:
+            self.refresh_calls += 1
+            return 1
+
+    svc = _BgKeyService()
+    stop = asyncio.Event()
+    bg = asyncio.create_task(run_worker_loop(svc, interval_seconds=0, stop_event=stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await bg
+
+    assert svc.refresh_calls >= 1, "refresh_keys must run even when recover_cooldowns raises"
+    assert svc.recover_calls >= 2, "loop must continue for later iterations after a phase failure"
+    messages = " ".join(r.getMessage() for r in caplog.records if r.name == "interfaces.workers.background")
+    assert "recover_cooldowns" in messages or "phase=recover_cooldowns" in messages
 
 
 def test_admin_key_crud_and_model_sync() -> None:

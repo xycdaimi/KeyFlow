@@ -6,7 +6,12 @@ services:
     build:
       context: ../..
       dockerfile: docker/src/Dockerfile
-    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "src"]
+    command:
+      [
+        "sh",
+        "-c",
+        "uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir src --workers ${UVICORN_WORKERS:-1}",
+      ]
     env_file:
       - ../../.env
     environment:
@@ -28,6 +33,20 @@ services:
       interval: 15s
       timeout: 5s
       retries: 3
+  keyflow-worker:
+    container_name: keyflow-worker
+    build:
+      context: ../..
+      dockerfile: docker/src/Dockerfile
+    command: ["python", "src/worker_main.py"]
+    env_file:
+      - ../../.env
+    environment:
+      DATABASE_URL_READ: ${DATABASE_URL_READ:-postgresql+asyncpg://keyflow:keyflow@keyflow-postgres:5432/keyflow}
+      DATABASE_URL_WRITE: ${DATABASE_URL_WRITE:-postgresql+asyncpg://keyflow:keyflow@keyflow-postgres:5432/keyflow}
+      REDIS_URL: ${REDIS_URL:-redis://keyflow-redis:6379/0}
+    networks:
+      - keyflow-network
 
 networks:
   keyflow-network:

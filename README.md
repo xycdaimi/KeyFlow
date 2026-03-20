@@ -12,12 +12,30 @@
 - `Redis + Lua` 提供高并发原子分配
 - `SQLAlchemy` 持久化 key 元数据
 
+## 运行时（v1）
+
+- **双运行时、单镜像**：同一镜像提供两个启动命令，`uvicorn main:app --app-dir src` 负责 HTTP，`python src/worker_main.py` 负责轻量周期后台扫描。
+- **同一部署单元**：本地 Docker 以一个 compose stack 中的 `keyflow-api + keyflow-worker` 两个服务表达；生产目标是 **same Pod, two containers**，不是两个彼此漂移的独立 Deployment。
+- **后台任务归 worker**：`recover_cooldowns` 与 `refresh_keys` 由 sidecar worker 周期执行，API `lifespan` 不再自启后台循环。
+- **共享真相源**：worker 保持无状态，只通过现有 PostgreSQL + Redis 仓储/缓存抽象工作。
+- **默认并发**：`.env.example` 与 `docker/src/Dockerfile` 中 `UVICORN_WORKERS` 默认为 **1**；需要扩展 HTTP 吞吐时只增加 API 进程，后台周期任务仍由 worker 负责。
+
 ## 本地开发
 ```bash
 pip install -e .[dev]
 uvicorn main:app --reload --app-dir src
-pytest
+python src/worker_main.py
 ```
+
+测试建议：
+
+- 日常本地回归优先使用当前默认安全的 targeted 集合（避免将「需外网或本地凭证」的 opt-in 集成测试或手工脚本误当作默认 CI 回归）：
+
+```bash
+python -m pytest tests/test_api.py tests/test_provider_plugins.py tests/test_redis_lua_integration.py tests/test_worker_runtime.py -q
+```
+
+- 若要验证 PostgreSQL 仓储集成，请在**可达数据库**的前提下单独执行 `tests/test_postgres_repository_integration.py`；宿主机默认 `127.0.0.1:5432` 在部分机器上可能失败，Docker 网络内环境为当前已验证路径。
 
 ## Docker 本地联调（拆分 Compose）
 
@@ -30,27 +48,29 @@ cp .env.example .env
 `docker/src/docker-compose.yml` 只使用根 `.env` 中的原始变量名；
 启动脚本会通过 `--env-file .env` 显式传入。
 
-2) 启动基础依赖：
+2) 使用原有脚本手动启动基础依赖：
 
 ```bash
-docker compose -f docker/postgresql/docker-compose.yml up -d
-docker compose -f docker/redis/docker-compose.yml up -d
+./scripts/start_postgre.sh
+./scripts/start_redis.sh
 ```
 
-3) 启动应用容器：
+3) 使用原有脚本手动启动应用栈：
 
 ```bash
-docker compose --env-file .env -f docker/src/docker-compose.yml up -d --build
+./scripts/start_src.sh
 ```
 
-4) 启动时自动检查并创建缺失表（已存在表不会重复创建）。
+4) `keyflow-api` 启动时自动检查并创建缺失表（已存在表不会重复创建）；`keyflow-worker` 复用同一镜像与配置，单独执行周期后台任务。
 
-5) 检查服务健康：
+5) 手动检查服务健康：
 
 ```bash
 curl http://localhost:8000/health
 docker compose -f docker/src/docker-compose.yml ps
 ```
+
+本地 compose 表达的是“一个整体部署单元里的两个运行时角色”；生产 Kubernetes 目标是 **same Pod, two containers**，而不是单独的 worker Deployment。
 
 6) 关闭：
 
@@ -87,7 +107,7 @@ scripts\stop_redis.bat
 scripts\stop_postgre.bat
 ```
 
-可选参数：
+启动/停止可选参数：
 
 ```bash
 ./scripts/start_src.sh --no-build

@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-03-20
+@Description: FastAPI 应用工厂与生命周期资源管理
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +15,6 @@ from fastapi import FastAPI
 
 from sqlalchemy import text
 
-from application.services.key_service import KeyService
 from container.container import create_container
 from infrastructure.cache.key_cache import RedisKeyCache
 from infrastructure.config.settings import Settings, get_settings
@@ -62,40 +67,16 @@ async def ensure_refresh_columns(conn) -> None:
         )
 
 
-async def run_background_tasks(
-    key_service: KeyService,
-    interval_seconds: int,
-    stop_event: asyncio.Event,
-) -> None:
-    """Periodically run recover_cooldowns and refresh_keys."""
-    while not stop_event.is_set():
-        try:
-            recovered = await key_service.recover_cooldowns()
-            refreshed = await key_service.refresh_keys()
-            if recovered or refreshed:
-                logger.info(
-                    "event=background_task source=keyflow recovered=%s refreshed=%s",
-                    recovered,
-                    refreshed,
-                )
-        except Exception as exc:
-            logger.warning("event=background_task_error source=keyflow error=%s", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
-        except asyncio.TimeoutError:
-            pass
-        except asyncio.CancelledError:
-            break
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         repository: SqlAlchemyKeyRepository = app.state.container.resolve(SqlAlchemyKeyRepository)
         redis_cache: RedisKeyCache = app.state.container.resolve(RedisKeyCache)
-        key_service: KeyService = app.state.container.resolve(KeyService)
-        settings: Settings = app.state.container.resolve(Settings)
-    except Exception:
+    except punq.MissingDependencyError as exc:
+        logger.info(
+            "event=lifespan_runtime_dependencies_missing source=api_startup error=%s",
+            exc,
+        )
         yield
         return
 
@@ -109,27 +90,45 @@ async def lifespan(app: FastAPI):
     async with write_engine.begin() as conn:
         await ensure_refresh_columns(conn)
 
-    stop_event = asyncio.Event()
-    bg_task = asyncio.create_task(
-        run_background_tasks(
-            key_service,
-            settings.background_task_interval_seconds,
-            stop_event,
-        )
-    )
-
     try:
         yield
     finally:
-        stop_event.set()
-        bg_task.cancel()
-        try:
-            await bg_task
-        except asyncio.CancelledError:
-            pass
         await redis_cache._redis.aclose()
         await write_engine.dispose()
         await read_engine.dispose()
+
+
+def attach_health_checkers(app: FastAPI, container: punq.Container) -> None:
+    """Register async check callables on app.state when DB and Redis are available in the container."""
+    try:
+        repository: SqlAlchemyKeyRepository = container.resolve(SqlAlchemyKeyRepository)
+        redis_cache: RedisKeyCache = container.resolve(RedisKeyCache)
+    except punq.MissingDependencyError:
+        return
+
+    async def check_app() -> tuple[bool, str | None]:
+        return True, None
+
+    async def check_database() -> tuple[bool, str | None]:
+        try:
+            async with repository._read_factory() as session:
+                await session.execute(text("SELECT 1"))
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+
+    async def check_redis() -> tuple[bool, str | None]:
+        try:
+            await redis_cache._redis.ping()
+            return True, None
+        except Exception as exc:
+            return False, str(exc)
+
+    app.state.health_checkers = {
+        "app": check_app,
+        "database": check_database,
+        "redis": check_redis,
+    }
 
 
 def create_app(container: punq.Container | None = None, settings: Settings | None = None) -> FastAPI:
@@ -144,6 +143,7 @@ def create_app(container: punq.Container | None = None, settings: Settings | Non
     )
     app.state.settings = app_settings
     app.state.container = app_container
+    attach_health_checkers(app, app_container)
 
     app.include_router(health_router)
     app.include_router(allocate_router, prefix=app_settings.api_prefix)
