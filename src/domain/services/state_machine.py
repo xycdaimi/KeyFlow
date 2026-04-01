@@ -11,6 +11,8 @@ class KeyStateMachine:
         self._rate_limit_backoff_minutes = rate_limit_backoff_minutes
 
     def on_success(self, key: ApiKey, tokens_used: int, now: datetime) -> ApiKey:
+        if key.status == KeyStatus.DISABLED_ADMIN:
+            return key
         key.register_success(tokens_used=tokens_used, now=now)
         return key
 
@@ -29,7 +31,7 @@ class KeyStateMachine:
             return key
 
         if normalized == "disabled":
-            key.status = KeyStatus.DISABLED
+            key.status = KeyStatus.DISABLED_REPORT
             return key
 
         key.status = KeyStatus.AVAILABLE

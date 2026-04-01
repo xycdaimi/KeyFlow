@@ -44,6 +44,8 @@ class UpdateKeyInput:
 
 
 class KeyService:
+    _ADMIN_WRITABLE_STATUSES = frozenset({KeyStatus.AVAILABLE, KeyStatus.DISABLED_ADMIN})
+
     def __init__(
         self,
         repository: KeyRepository,
@@ -78,8 +80,8 @@ class KeyService:
             provider=provider,
             credential=data.credential,
         )
-        await self._sync_models(key, plugin=plugin)
         await self._refresh_single_key(key, now, plugin=plugin)
+        await self._sync_models(key, plugin=plugin)
         await self._repository.upsert_key(key)
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
         return key
@@ -96,9 +98,11 @@ class KeyService:
                     f"credential already exists for provider {key.provider} (key_id={existing.id})"
                 )
             key.credential = data.credential
-            await self._sync_models(key, plugin=plugin)
             await self._refresh_single_key(key, utcnow(), plugin=plugin)
+            await self._sync_models(key, plugin=plugin)
         if data.status is not None:
+            if data.status not in self._ADMIN_WRITABLE_STATUSES:
+                raise ValueError("status must be one of: available, disabled_admin")
             key.status = data.status
         await self._repository.upsert_key(key)
         await self._allocation_store.sync_key(key, self._scorer.score(key, utcnow()))
@@ -195,7 +199,7 @@ class KeyService:
         model: str | None,
         now: datetime,
     ) -> tuple[list[ApiKey], dict[str, float | None]]:
-        """Use cached availability/capacity when fresh. No plugin calls during allocation."""
+        """Use cached refresh freshness and key status. No plugin calls during allocation."""
         candidates: list[ApiKey] = []
         capacity_by_key_id: dict[str, float | None] = {}
 
@@ -207,10 +211,9 @@ class KeyService:
 
             plugin = self._provider_registry.get(key.provider)
             if plugin is not None:
-                if self._is_cache_fresh(key, now) and key.cached_available is True:
-                    capacity_by_key_id[key.id] = key.cached_capacity_score
-                else:
+                if not self._is_cache_fresh(key, now):
                     continue
+                capacity_by_key_id[key.id] = key.cached_capacity_score
             else:
                 capacity_by_key_id[key.id] = None
 
@@ -277,8 +280,7 @@ class KeyService:
         return recovered_count
 
     async def refresh_keys(self, model: str | None = None) -> int:
-        """Refresh availability/capacity for keys needing it. Uses claim_refresh to avoid
-        duplicate work across multiple processes."""
+        """Refresh availability/capacity for keys needing it."""
         now = utcnow()
         cutoff = now - timedelta(seconds=self._refresh_cache_seconds)
         keys = await self._repository.list_keys_needing_refresh(cutoff)
@@ -288,58 +290,78 @@ class KeyService:
                 continue
             plugin = self._provider_registry.get(key.provider)
             if plugin is None:
-                key.last_refreshed_at = now
                 key.cached_available = True
+                key.cached_quota_available = None
                 key.cached_capacity_score = None
+                key.last_refreshed_at = now
+                self._merge_refresh_signals_into_status(key, now)
                 await self._repository.upsert_key(key)
                 refreshed += 1
                 continue
-            if key.disabled_reason == "fetch_models_failed":
-                await self._sync_models(key, plugin=plugin)
-                if key.disabled_reason == "fetch_models_failed":
-                    key.last_refreshed_at = now
-                    await self._repository.upsert_key(key)
-                    await self._allocation_store.sync_key(key, self._scorer.score(key, now))
-                    refreshed += 1
-                    continue
-            try:
-                available = await plugin.is_credential_available(key.credential, model)
-            except Exception as exc:
-                logger.warning("refresh is_credential_available failed for %s: %s", key.id, exc)
-                available = False
-            key.cached_available = available
+
+            key.cached_available = await self._probe_credential_available(key, plugin, model)
+            key.cached_quota_available, key.cached_capacity_score = await self._probe_capacity(key, plugin)
             key.last_refreshed_at = now
-            try:
-                signal = await plugin.get_capacity_signal(key.credential)
-                key.cached_capacity_score = signal.capacity_score if signal else None
-            except Exception as exc:
-                logger.warning("refresh get_capacity_signal failed for %s: %s", key.id, exc)
-                key.cached_capacity_score = None
+            self._merge_refresh_signals_into_status(key, now)
+            await self._sync_models(key, plugin=plugin)
             await self._repository.upsert_key(key)
             await self._allocation_store.sync_key(key, self._scorer.score(key, now))
             refreshed += 1
         return refreshed
 
     async def _refresh_single_key(self, key: ApiKey, now: datetime, plugin=None) -> None:
-        """Refresh one key's cached_available and cached_capacity_score (no claim)."""
+        """Refresh one key's availability/capacity cache and merge status."""
         plugin = plugin or self._provider_registry.get(key.provider)
         if plugin is None:
-            key.last_refreshed_at = now
             key.cached_available = True
+            key.cached_quota_available = None
             key.cached_capacity_score = None
+            key.last_refreshed_at = now
+            self._merge_refresh_signals_into_status(key, now)
             return
-        try:
-            key.cached_available = await plugin.is_credential_available(key.credential, None)
-        except Exception as exc:
-            logger.warning("_refresh_single_key is_credential_available failed for %s: %s", key.id, exc)
-            key.cached_available = False
+
+        key.cached_available = await self._probe_credential_available(key, plugin, None)
+        key.cached_quota_available, key.cached_capacity_score = await self._probe_capacity(key, plugin)
         key.last_refreshed_at = now
+        self._merge_refresh_signals_into_status(key, now)
+
+    async def _probe_credential_available(self, key: ApiKey, plugin, model: str | None) -> bool:
+        try:
+            return await plugin.is_credential_available(key.credential, model)
+        except Exception as exc:
+            logger.warning("is_credential_available failed for %s: %s", key.id, exc)
+            return False
+
+    async def _probe_capacity(self, key: ApiKey, plugin) -> tuple[bool | None, float | None]:
         try:
             signal = await plugin.get_capacity_signal(key.credential)
-            key.cached_capacity_score = signal.capacity_score if signal else None
         except Exception as exc:
-            logger.warning("_refresh_single_key get_capacity_signal failed for %s: %s", key.id, exc)
-            key.cached_capacity_score = None
+            logger.warning("get_capacity_signal failed for %s: %s", key.id, exc)
+            return None, None
+        if signal is None:
+            return None, None
+        quota_available = getattr(signal, "quota_available", None)
+        return quota_available, signal.capacity_score
+
+    def _merge_refresh_signals_into_status(self, key: ApiKey, now: datetime) -> None:
+        if key.status in {KeyStatus.DISABLED_ADMIN, KeyStatus.DISABLED_REPORT}:
+            return
+
+        if key.cached_available is False:
+            key.status = KeyStatus.DISABLED_UPSTREAM
+            return
+
+        if key.cached_available is True and key.cached_quota_available is False:
+            key.status = KeyStatus.EXHAUSTED
+            return
+
+        if key.status == KeyStatus.DISABLED_UPSTREAM and key.cached_available is True:
+            key.status = KeyStatus.AVAILABLE
+
+        if key.status == KeyStatus.EXHAUSTED and key.cached_quota_available is True:
+            key.status = KeyStatus.AVAILABLE
+
+        self._state_machine.recover_if_ready(key, now)
 
     async def _get_required_key(self, key_id: str) -> ApiKey:
         key = await self._repository.get_key(key_id)
@@ -348,20 +370,14 @@ class KeyService:
         return key
 
     async def _sync_models(self, key: ApiKey, plugin=None) -> None:
-        """Fetch and store the supported model list from the plugin."""
+        """Fetch and store provider model list. Failures do not change status."""
         plugin = plugin or self._provider_registry.get(key.provider)
         if plugin is None:
             return
         try:
             key.supported_models = await plugin.fetch_models(key.credential)
-            if key.status == KeyStatus.DISABLED and key.disabled_reason == "fetch_models_failed":
-                key.status = KeyStatus.AVAILABLE
-                key.disabled_reason = None
         except Exception as exc:
             key.supported_models = []
-            key.status = KeyStatus.DISABLED
-            key.disabled_reason = "fetch_models_failed"
-            key.cached_available = False
             logger.warning("fetch_models failed for %s: %s", key.id, exc)
 
     def _require_ready_provider(self, provider: str):

@@ -159,7 +159,7 @@ async def test_recover_cooldowns_is_safe_to_call_more_than_once() -> None:
 
 
 @pytest.mark.anyio
-async def test_refresh_keys_retries_fetch_models_for_fetch_models_failed_key() -> None:
+async def test_refresh_keys_retries_fetch_models_without_status_side_effect() -> None:
     now = datetime.now(timezone.utc) - timedelta(minutes=10)
 
     class _RetryFetchModelsPlugin(FakeProviderPlugin):
@@ -180,11 +180,10 @@ async def test_refresh_keys_retries_fetch_models_for_fetch_models_failed_key() -
                 id="key-1",
                 provider="openai",
                 credential={"api_key": "sk-test"},
-                status=KeyStatus.DISABLED,
-                disabled_reason="fetch_models_failed",
+                status=KeyStatus.AVAILABLE,
                 supported_models=[],
                 last_refreshed_at=now,
-                cached_available=False,
+                cached_available=True,
             )
         ],
         plugin,
@@ -195,6 +194,5 @@ async def test_refresh_keys_retries_fetch_models_for_fetch_models_failed_key() -
     assert refreshed == 1
     assert plugin.fetch_attempts == 2
     assert repository._keys["key-1"].status == KeyStatus.AVAILABLE
-    assert repository._keys["key-1"].disabled_reason is None
     assert repository._keys["key-1"].supported_models == ["gpt-4o"]
     assert repository._keys["key-1"].cached_available is True

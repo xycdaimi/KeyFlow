@@ -117,10 +117,10 @@ async def test_upsert_and_get_round_trip_structured_fields(
         success_count=7,
         error_count=3,
         cooldown_until=cooldown,
-        disabled_reason="rate",
         supported_models=["gpt-4o", "o1-mini"],
         last_refreshed_at=refreshed,
         cached_available=True,
+        cached_quota_available=True,
         cached_capacity_score=0.875,
     )
 

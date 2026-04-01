@@ -236,7 +236,7 @@ X-Internal-Key: dev-internal-key
 
 **功能**
 
-为指定供应商新增一个凭据账号。创建时会调用对应插件同步支持的模型列表，接口响应返回成功状态及新建 Key 的 `key_id`。
+为指定供应商新增一个凭据账号。创建时会先通过插件刷新可用性/容量缓存（`is_credential_available` / `get_capacity_signal`），再同步支持的模型列表（`fetch_models`），接口响应返回成功状态及新建 Key 的 `key_id`。
 
 **路径参数**
 
@@ -335,7 +335,7 @@ X-Internal-Key: dev-internal-key
 
 **功能**
 
-更新某个 Key 的凭据或状态。若更新了凭据，会重新同步支持模型列表；接口响应只返回成功或失败状态。
+更新某个 Key 的凭据或状态。若更新了凭据，会先刷新可用性/容量缓存，再重新同步支持模型列表；接口响应只返回成功或失败状态。
 
 **路径参数**
 
@@ -355,7 +355,7 @@ X-Internal-Key: dev-internal-key
 字段说明：
 
 - `credential`: 可选，新的结构化凭据
-- `status`: 可选，可设置为 `available`、`rate_limited`、`cooldown`、`disabled`、`exhausted`
+- `status`: 可选，仅允许设置为 `available`、`disabled_admin`
 
 **成功返回示例**
 

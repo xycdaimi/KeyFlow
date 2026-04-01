@@ -13,7 +13,8 @@ class OpenRouterPlugin(ProviderPlugin):
 
     """Plugin for OpenRouter.
 
-    Availability: key is valid AND has remaining credit balance.
+    Credential availability: key is valid/reachable.
+    Quota availability: exposed via get_capacity_signal.
 
     Internal billing logic:
         - Queries /api/v1/auth/key for (limit, usage).
@@ -74,6 +75,7 @@ class OpenRouterPlugin(ProviderPlugin):
             return CapacitySignal(
                 has_capacity_signal=True,
                 capacity_score=score,
+                quota_available=(True if data.get("is_free_tier") else (remaining > 0)),
                 capacity_kind="remaining_budget_ratio",
                 reason=f"limit_reset={data.get('limit_reset', 'unknown')}",
             )
@@ -89,7 +91,7 @@ class OpenRouterPlugin(ProviderPlugin):
             return [item["id"] for item in r.json().get("data", [])]
 
     async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
-        """Available when the key is valid and has positive credit balance."""
+        """Available when the credential itself is valid/reachable."""
         api_key = self._api_key(credential)
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
@@ -98,13 +100,7 @@ class OpenRouterPlugin(ProviderPlugin):
             )
             if r.status_code in (401, 403):
                 return False
-            if not r.is_success:
-                return True  # transient — keep available
-
-            data = r.json().get("data", {})
-            if data.get("is_free_tier"):
-                return True
-            return self._remaining_budget(data) > 0
+            return True
 
     async def explain_credential(self, credential: dict[str, str]) -> dict:
         api_key = self._api_key(credential)

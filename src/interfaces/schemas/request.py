@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from domain.value_objects.key_status import KeyStatus
 
@@ -41,3 +41,12 @@ class UpdateKeyRequest(BaseModel):
 
     credential: dict[str, str] | None = None
     status: KeyStatus | None = None
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: KeyStatus | None) -> KeyStatus | None:
+        if value is None:
+            return None
+        if value in {KeyStatus.AVAILABLE, KeyStatus.DISABLED_ADMIN}:
+            return value
+        raise ValueError("status must be one of: available, disabled_admin")

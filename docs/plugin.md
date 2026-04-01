@@ -35,7 +35,9 @@
 - `AVAILABLE`
 - `RATE_LIMITED`
 - `COOLDOWN`
-- `DISABLED`
+- `DISABLED_UPSTREAM`
+- `DISABLED_ADMIN`
+- `DISABLED_REPORT`
 - `EXHAUSTED`
 
 插件可以维护私有临时状态或缓存，但不替代核心正式状态机。
@@ -111,6 +113,7 @@ class ProviderPlugin(Protocol):
 class CapacitySignal:
     has_capacity_signal: bool
     capacity_score: float | None
+    quota_available: bool | None
     capacity_kind: str
     reason: str
 ```
@@ -199,8 +202,8 @@ get_capacity_signal(credential)
 ### 6.1 新增账户时
 
 1. 管理端创建账户
-2. 核心调用 `fetch_models(credential)`
-3. 核心保存 `supported_models`
+2. 核心调用 `is_credential_available` 与 `get_capacity_signal`，写入缓存可用性/容量（与后台 `refresh_keys` 语义一致）
+3. 核心调用 `fetch_models(credential)` 并保存 `supported_models`（失败只记录日志，不改变 `status`）
 
 ### 6.2 分配时
 
@@ -257,7 +260,7 @@ get_capacity_signal(credential)
 
 例如：
 
-- 插件判断认证失效 -> 核心后续可将账户置为 `DISABLED`
+- 插件判断认证失效 -> 核心后续可将账户置为 `DISABLED_UPSTREAM`
 - 插件判断短期限流 -> 核心可进入 `RATE_LIMITED / COOLDOWN`
 
 ---

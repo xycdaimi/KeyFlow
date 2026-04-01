@@ -56,10 +56,11 @@ async def ensure_schema_ready(write_engine) -> None:
 
 
 async def ensure_refresh_columns(conn) -> None:
-    """Add last_refreshed_at, cached_available, cached_capacity_score if missing."""
+    """Add refresh/cache columns if missing."""
     for col, sql_type in [
         ("last_refreshed_at", "TIMESTAMP WITH TIME ZONE"),
         ("cached_available", "BOOLEAN"),
+        ("cached_quota_available", "BOOLEAN"),
         ("cached_capacity_score", "DOUBLE PRECISION"),
     ]:
         await conn.execute(

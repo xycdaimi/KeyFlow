@@ -34,12 +34,13 @@ class ApiKey:
     success_count: int = 0
     error_count: int = 0
     cooldown_until: datetime | None = None
-    disabled_reason: str | None = None
     supported_models: list = field(default_factory=list)
     last_refreshed_at: datetime | None = None
     """Last time this key's availability/capacity was refreshed by the background task."""
     cached_available: bool | None = None
-    """Cached availability from plugin. None = not yet refreshed."""
+    """Cached credential-level availability from plugin. None = not yet refreshed."""
+    cached_quota_available: bool | None = None
+    """Cached quota/budget availability from plugin signal. None = unknown."""
     cached_capacity_score: float | None = None
     """Cached capacity score from plugin. None = unknown or not refreshed."""
     """Model IDs fetched from the provider once at registration."""
@@ -58,7 +59,12 @@ class ApiKey:
 
     def is_available(self, now: datetime | None = None) -> bool:
         current = now or utcnow()
-        if self.status in {KeyStatus.DISABLED, KeyStatus.EXHAUSTED}:
+        if self.status in {
+            KeyStatus.DISABLED_UPSTREAM,
+            KeyStatus.DISABLED_ADMIN,
+            KeyStatus.DISABLED_REPORT,
+            KeyStatus.EXHAUSTED,
+        }:
             return False
         if self.status in {KeyStatus.COOLDOWN, KeyStatus.RATE_LIMITED}:
             if self.cooldown_until:

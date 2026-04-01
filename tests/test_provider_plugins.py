@@ -285,7 +285,7 @@ async def test_openrouter_availability_uses_limit_reset_period_usage(monkeypatch
 
 
 @pytest.mark.anyio
-async def test_openrouter_availability_returns_false_when_period_budget_exhausted(
+async def test_openrouter_availability_remains_true_when_period_budget_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _FakeResponse:
@@ -321,7 +321,47 @@ async def test_openrouter_availability_returns_false_when_period_budget_exhauste
 
     plugin = OpenRouterPlugin()
 
-    assert await plugin.is_credential_available({"api_key": "sk-or-secret"}) is False
+    assert await plugin.is_credential_available({"api_key": "sk-or-secret"}) is True
+
+
+@pytest.mark.anyio
+async def test_openrouter_capacity_marks_quota_unavailable_when_budget_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeResponse:
+        is_success = True
+
+        @staticmethod
+        def json() -> dict:
+            return {
+                "data": {
+                    "is_free_tier": False,
+                    "limit": 300,
+                    "limit_reset": "monthly",
+                    "usage_monthly": 301.0,
+                }
+            }
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, *args, **kwargs) -> _FakeResponse:
+            return _FakeResponse()
+
+    monkeypatch.setattr(
+        "infrastructure.plugins.providers.openrouter.httpx.AsyncClient",
+        lambda timeout=10: _FakeClient(),
+    )
+
+    plugin = OpenRouterPlugin()
+    signal = await plugin.get_capacity_signal({"api_key": "sk-or-secret"})
+
+    assert signal is not None
+    assert signal.quota_available is False
 
 
 @pytest.mark.anyio
@@ -359,7 +399,7 @@ async def test_openai_availability_uses_models_endpoint_only(monkeypatch: pytest
 
 
 @pytest.mark.anyio
-async def test_openai_availability_returns_false_for_auth_or_rate_limit(
+async def test_openai_availability_returns_false_for_auth_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _FakeResponse:
@@ -385,13 +425,46 @@ async def test_openai_availability_returns_false_for_auth_or_rate_limit(
         async def get(self, *args, **kwargs) -> _FakeResponse:
             return _FakeResponse(self._status_code)
 
-    for status_code in (401, 403, 429):
+    for status_code in (401, 403):
         monkeypatch.setattr(
             "infrastructure.plugins.providers.openai.httpx.AsyncClient",
             lambda timeout=10, status_code=status_code: _FakeClient(status_code),
         )
         plugin = OpenAIPlugin()
         assert await plugin.is_credential_available({"api_key": "sk-test"}) is False
+
+
+@pytest.mark.anyio
+async def test_openai_availability_keeps_true_for_quota_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeResponse:
+        is_success = False
+        status_code = 429
+
+        @staticmethod
+        def json() -> dict:
+            return {"error": {"message": "You exceeded your current quota"}}
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        async def get(self, *args, **kwargs) -> _FakeResponse:
+            return _FakeResponse()
+
+    monkeypatch.setattr(
+        "infrastructure.plugins.providers.openai.httpx.AsyncClient",
+        lambda timeout=10: _FakeClient(),
+    )
+
+    plugin = OpenAIPlugin()
+    assert await plugin.is_credential_available({"api_key": "sk-test"}) is True
+
+    signal = await plugin.get_capacity_signal({"api_key": "sk-test"})
+    assert signal is not None
+    assert signal.quota_available is False
 
 
 @pytest.mark.anyio

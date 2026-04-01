@@ -64,10 +64,10 @@ class SqlAlchemyKeyRepository(KeyRepository):
             model.error_count = key.error_count
             model.last_used_at = key.last_used_at
             model.cooldown_until = key.cooldown_until
-            model.disabled_reason = key.disabled_reason
             model.supported_models = key.supported_models
             model.last_refreshed_at = key.last_refreshed_at
             model.cached_available = key.cached_available
+            model.cached_quota_available = key.cached_quota_available
             model.cached_capacity_score = key.cached_capacity_score
 
             await session.commit()
@@ -133,9 +133,9 @@ class SqlAlchemyKeyRepository(KeyRepository):
             success_count=model.success_count,
             error_count=model.error_count,
             cooldown_until=model.cooldown_until,
-            disabled_reason=model.disabled_reason,
             supported_models=model.supported_models or [],
             last_refreshed_at=model.last_refreshed_at,
             cached_available=model.cached_available,
+            cached_quota_available=model.cached_quota_available,
             cached_capacity_score=model.cached_capacity_score,
         )

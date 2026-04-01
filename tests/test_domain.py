@@ -414,7 +414,31 @@ async def test_update_key_rejects_duplicate_credential_within_same_provider() ->
 
 
 @pytest.mark.anyio
-async def test_update_key_clears_models_and_disables_key_when_fetch_models_fails() -> None:
+async def test_update_key_rejects_non_admin_writable_status() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-a"},
+            ),
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    with pytest.raises(ValueError):
+        await service.update_key("key-1", UpdateKeyInput(status=KeyStatus.DISABLED_REPORT))
+
+
+@pytest.mark.anyio
+async def test_update_key_clears_models_but_keeps_status_when_fetch_models_fails() -> None:
     class _FetchModelsFailPlugin(FakeProviderPlugin):
         async def fetch_models(self, credential: dict[str, str]) -> list[str]:
             raise RuntimeError("models unavailable")
@@ -442,9 +466,9 @@ async def test_update_key_clears_models_and_disables_key_when_fetch_models_fails
     updated = await service.update_key("key-1", UpdateKeyInput(credential={"api_key": "sk-new"}))
 
     assert updated.supported_models == []
-    assert updated.status == KeyStatus.DISABLED
+    assert updated.status == KeyStatus.AVAILABLE
     assert repository._keys["key-1"].supported_models == []
-    assert repository._keys["key-1"].status == KeyStatus.DISABLED
+    assert repository._keys["key-1"].status == KeyStatus.AVAILABLE
 
 
 @pytest.mark.anyio
@@ -488,3 +512,104 @@ async def test_in_memory_allocation_store_reuses_key_after_lease_expires() -> No
     assert first == "key-1"
     assert second == "key-2"
     assert third == "key-1"
+
+
+@pytest.mark.anyio
+async def test_refresh_sets_disabled_upstream_when_credential_unavailable() -> None:
+    now = datetime.now(timezone.utc) - timedelta(minutes=10)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+                last_refreshed_at=now,
+                cached_available=True,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=False)),
+    )
+
+    await service.refresh_keys()
+
+    assert repository._keys["key-1"].status == KeyStatus.DISABLED_UPSTREAM
+    assert repository._keys["key-1"].cached_available is False
+
+
+@pytest.mark.anyio
+async def test_refresh_sets_exhausted_when_quota_known_unavailable() -> None:
+    now = datetime.now(timezone.utc) - timedelta(minutes=10)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openrouter",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+                last_refreshed_at=now,
+            )
+        ]
+    )
+    plugin = FakeProviderPlugin(
+        "openrouter",
+        ["gpt-4o"],
+        available=True,
+        capacity_signal=CapacitySignal(
+            has_capacity_signal=True,
+            capacity_score=0.0,
+            quota_available=False,
+            capacity_kind="remaining_budget_ratio",
+            reason="exhausted",
+        ),
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(plugin),
+    )
+
+    await service.refresh_keys()
+
+    assert repository._keys["key-1"].status == KeyStatus.EXHAUSTED
+    assert repository._keys["key-1"].cached_available is True
+    assert repository._keys["key-1"].cached_quota_available is False
+
+
+@pytest.mark.anyio
+async def test_refresh_does_not_override_disabled_admin() -> None:
+    now = datetime.now(timezone.utc) - timedelta(minutes=10)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.DISABLED_ADMIN,
+                last_refreshed_at=now,
+            )
+        ]
+    )
+    plugin = FakeProviderPlugin("openai", ["gpt-4o"], available=True)
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(plugin),
+    )
+
+    await service.refresh_keys()
+
+    assert repository._keys["key-1"].status == KeyStatus.DISABLED_ADMIN

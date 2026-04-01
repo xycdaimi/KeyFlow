@@ -24,12 +24,13 @@ class ApiKeyModel(Base):
     error_count: Mapped[int] = mapped_column(Integer, default=0)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    disabled_reason: Mapped[str | None] = mapped_column(String(255), nullable=True)
     supported_models: Mapped[list] = mapped_column(JSON, default=list)
     """Model IDs fetched at registration. Informational only."""
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     """Last time availability/capacity was refreshed. Used to avoid duplicate refresh across processes."""
     cached_available: Mapped[bool | None] = mapped_column(nullable=True)
-    """Cached is_credential_available result. None = not yet refreshed."""
+    """Cached credential-level availability result. None = not yet refreshed."""
+    cached_quota_available: Mapped[bool | None] = mapped_column(nullable=True)
+    """Cached quota availability result. None = unknown."""
     cached_capacity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     """Cached capacity score from plugin. None = unknown."""

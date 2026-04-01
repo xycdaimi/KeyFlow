@@ -25,7 +25,11 @@ class KeyScorer:
         self.weights = weights or ScoreWeights()
 
     def score(self, key: ApiKey, now: datetime, capacity_score: float | None = None) -> float:
-        if key.status == KeyStatus.DISABLED:
+        if key.status in {
+            KeyStatus.DISABLED_UPSTREAM,
+            KeyStatus.DISABLED_ADMIN,
+            KeyStatus.DISABLED_REPORT,
+        }:
             return float("-inf")
         if key.status == KeyStatus.EXHAUSTED:
             return float("-inf")

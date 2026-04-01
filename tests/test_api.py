@@ -77,6 +77,7 @@ def build_client(plugin_available: bool = True) -> TestClient:
                 id="key-1",
                 provider="openai",
                 credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE if plugin_available else KeyStatus.DISABLED_UPSTREAM,
                 quota_used=0,
                 last_used_at=now,
                 last_refreshed_at=now,
@@ -989,6 +990,18 @@ def test_update_key_rejects_duplicate_credential_within_same_provider() -> None:
 
     assert response.status_code == 409
     assert response.json() == {"detail": "duplicate_credential"}
+
+
+def test_update_key_rejects_non_admin_writable_status() -> None:
+    client = build_client()
+
+    response = client.put(
+        "/api/keys/key-1",
+        json={"status": "disabled_report"},
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 422
 
 
 def test_get_key_models_rejects_provider_mismatch() -> None:

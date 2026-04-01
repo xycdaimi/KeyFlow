@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import httpx
 
-from infrastructure.plugins.base import ProviderPlugin
+from infrastructure.plugins.base import CapacitySignal, ProviderPlugin
 
 _BASE_URL = "https://api.openai.com/v1"
 
@@ -11,28 +11,13 @@ class OpenAIPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
-    """Plugin for the official OpenAI API.
-
-    Availability is inferred from a lightweight API request.
-
-    The current implementation validates the credential through ``/v1/models``:
-        - 200 -> VALID
-        - 401 -> INVALID_KEY
-        - 429 + quota semantics -> NO_BALANCE
-        - 429 + other semantics -> RATE_LIMIT
-        - others -> UNKNOWN
-    """
-
     @property
     def name(self) -> str:
         return "openai"
 
     @property
     def description(self) -> str:
-        return (
-            "OpenAI 官方 API（api.openai.com）。"
-            "可用性取决于轻量 API 请求是否成功，401/403/429 视为当前不可用。"
-        )
+        return "OpenAI official API at api.openai.com."
 
     @property
     def auth_type(self) -> str:
@@ -40,7 +25,7 @@ class OpenAIPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "sk-..."}（OpenAI API Key，Bearer 令牌）'
+        return '{"api_key": "sk-..."} (OpenAI API Key, Bearer token)'
 
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
@@ -52,7 +37,6 @@ class OpenAIPlugin(ProviderPlugin):
             payload = response.json()
         except Exception:
             return ""
-
         error = payload.get("error")
         if isinstance(error, dict):
             parts = [
@@ -64,27 +48,18 @@ class OpenAIPlugin(ProviderPlugin):
         return str(payload).lower()
 
     @classmethod
-    def _availability_status(cls, response: httpx.Response) -> str:
-        if response.is_success:
-            return "VALID"
-
-        if response.status_code in (401, 403):
-            return "INVALID_KEY"
-
-        if response.status_code == 429:
-            error_text = cls._error_payload_text(response)
-            quota_markers = (
-                "quota",
-                "insufficient_quota",
-                "exceeded your current quota",
-                "billing",
-                "credit balance",
-            )
-            if any(marker in error_text for marker in quota_markers):
-                return "NO_BALANCE"
-            return "RATE_LIMIT"
-
-        return "UNKNOWN"
+    def _is_quota_exhausted_error(cls, response: httpx.Response) -> bool:
+        if response.status_code != 429:
+            return False
+        error_text = cls._error_payload_text(response)
+        quota_markers = (
+            "quota",
+            "insufficient_quota",
+            "exceeded your current quota",
+            "billing",
+            "credit balance",
+        )
+        return any(marker in error_text for marker in quota_markers)
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         api_key = self._api_key(credential)
@@ -97,14 +72,46 @@ class OpenAIPlugin(ProviderPlugin):
             return [item["id"] for item in response.json().get("data", [])]
 
     async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
-        """OpenAI key availability is inferred from one lightweight API request."""
+        """Credential-level availability only."""
         api_key = self._api_key(credential)
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
+            response = await client.get(
                 f"{_BASE_URL}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
-            return self._availability_status(r) in {"VALID", "UNKNOWN"}
+            if response.status_code in (401, 403):
+                return False
+            return True
+
+    async def get_capacity_signal(self, credential: dict[str, str]) -> CapacitySignal | None:
+        api_key = self._api_key(credential)
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(
+                    f"{_BASE_URL}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+        except Exception:
+            return None
+        if response.status_code in (401, 403):
+            return None
+        if self._is_quota_exhausted_error(response):
+            return CapacitySignal(
+                has_capacity_signal=True,
+                capacity_score=0.0,
+                quota_available=False,
+                capacity_kind="quota_error",
+                reason="insufficient_quota",
+            )
+        if response.is_success:
+            return CapacitySignal(
+                has_capacity_signal=False,
+                capacity_score=None,
+                quota_available=True,
+                capacity_kind="unknown",
+                reason="models_endpoint_success",
+            )
+        return None
 
     async def explain_credential(self, credential: dict[str, str]) -> dict:
         api_key = self._api_key(credential)
