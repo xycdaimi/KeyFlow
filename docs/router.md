@@ -74,11 +74,17 @@ X-Internal-Key: dev-internal-key
 ```json
 {
   "key_id": "key-1",
+  "provider_model": "gpt-4o",
   "credential": {
     "api_key": "sk-test"
   }
 }
 ```
+
+说明：
+
+- `model` 是调用方传入的规范模型名（canonical name）
+- `provider_model` 是本次选中凭据对应的 provider 原生模型名；上游调用 provider API 时应使用该值
 
 **常见错误**
 
@@ -120,6 +126,7 @@ X-Internal-Key: dev-internal-key
 {
   "key_id": "key-openrouter",
   "provider": "openrouter",
+  "provider_model": "openai/gpt-4o",
   "credential": {
     "api_key": "sk-or-best"
   }
@@ -129,6 +136,7 @@ X-Internal-Key: dev-internal-key
 说明：
 
 - `provider`: 本次被选中凭证所属的 provider 名称
+- `provider_model`: 本次被选中凭证对应的 provider 原生模型名（来自 alias 映射或直连匹配）
 - `credential`: 该 provider 对应的认证凭据内容
 
 **常见错误**
@@ -299,6 +307,45 @@ X-Internal-Key: dev-internal-key
   }
 ]
 ```
+
+## 13. Status Contract
+
+系统当前对外暴露的 `status` 一共有 7 个：
+
+- `available`
+- `rate_limited`
+- `cooldown`
+- `disabled_upstream`
+- `disabled_admin`
+- `disabled_report`
+- `exhausted`
+
+这些状态的写入来源必须区分清楚：
+
+- 管理端 `PUT /api/keys/{key_id}` 只能写 `available`、`disabled_admin`
+- 上游如果承担管理后台职责，可以通过管理端 `PUT /api/keys/{key_id}` 显式设置 `disabled_admin`
+- 上游如果承担管理后台职责，也可以通过同一个接口把 `disabled_admin` 改回 `available`
+- 上游网关不能通过管理端接口直接写 `rate_limited`、`cooldown`、`disabled_upstream`、`disabled_report`、`exhausted`
+- 上游网关在运行期应通过 `POST /api/internal/report-error` 和 `POST /api/internal/report-success` 驱动运行态状态变化
+- 后台刷新任务会通过插件 `is_credential_available` 与 `get_capacity_signal` 自动合成 `disabled_upstream`、`exhausted`
+
+管理场景示例：
+
+- 管理员手工禁用某个 key：`PUT /api/keys/{key_id}`，请求体 `{"status": "disabled_admin"}`
+- 管理员恢复某个 key：`PUT /api/keys/{key_id}`，请求体 `{"status": "available"}`
+
+推荐给上游网关的状态驱动方式：
+
+- 请求成功后调用 `POST /api/internal/report-success`
+- 命中限流后调用 `POST /api/internal/report-error`，`error_type=rate_limit`
+- 明确额度耗尽后调用 `POST /api/internal/report-error`，`error_type=quota_exhausted`
+- 明确该 key 应业务禁用后调用 `POST /api/internal/report-error`，`error_type=disabled`
+
+不要把“管理禁用”与“运行态上报”混为一谈：
+
+- `disabled_admin` 是管理动作
+- `disabled_report` 是运行态上报动作
+- `disabled_upstream` 是刷新探测动作
 
 **空列表示例**
 

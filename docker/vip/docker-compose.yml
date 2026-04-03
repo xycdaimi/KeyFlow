@@ -1,11 +1,14 @@
+# VIP 密钥池：与 docker/src 共用同一 PostgreSQL / Redis（容器名 keyflow-postgres、keyflow-redis）。
+# 须与基础栈在同一 Docker 网络：先启动 docker/postgresql、docker/redis（及可选 docker/src），
+# 其 project name 为 keyflow 时会创建网络 keyflow_keyflow-network；本文件通过 external 加入该网络。
 name: keyflow
 
 services:
-  keyflow-api:
-    container_name: keyflow-api
+  keyflow-vip-api:
+    container_name: keyflow-vip-api
     build:
       context: ../..
-      dockerfile: docker/src/Dockerfile
+      dockerfile: docker/vip/Dockerfile
     command:
       [
         "sh",
@@ -30,18 +33,19 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)",
+          "import os,urllib.request; p=os.environ.get('PORT','8001'); urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=3)",
         ]
       interval: 15s
       timeout: 5s
       retries: 3
-  keyflow-worker:
-    container_name: keyflow-worker
+
+  keyflow-vip-worker:
+    container_name: keyflow-vip-worker
     build:
       context: ../..
-      dockerfile: docker/src/Dockerfile
+      dockerfile: docker/vip/Dockerfile
     depends_on:
-      keyflow-api:
+      keyflow-vip-api:
         condition: service_healthy
     command: ["python", "src/worker_main.py"]
     env_file:

@@ -1,14 +1,17 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from application.services.key_service import CreateKeyInput, KeyService, UpdateKeyInput
+from application.services.model_alias_resolver import ModelAliasResolver
 from domain.entities.api_key import ApiKey
 from domain.exceptions.domain_exceptions import (
     DuplicateCredentialError,
     ProviderNotFoundError,
     ProviderNotReadyError,
+    UpstreamUnreachableError,
 )
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer, ScoreWeights
@@ -22,6 +25,8 @@ from tests.fakes import (
     InMemoryKeyRepository,
     build_provider_registry,
 )
+
+MODEL_ALIAS_VALID_PATH = Path("tests/output/model_alias/valid_with_aliases.yaml")
 
 
 def test_scorer_prefers_healthier_key() -> None:
@@ -192,7 +197,8 @@ async def test_service_allocate_by_model_prefers_best_key_across_providers() -> 
 
     selected = await service.allocate_key_by_model("gpt-4o")
 
-    assert selected.id == "openrouter-high"
+    assert selected.key.id == "openrouter-high"
+    assert selected.provider_model == "gpt-4o"
     assert allocation_store.any_provider_ordered_ids == ["openrouter-high", "openai-low"]
 
 
@@ -255,8 +261,75 @@ async def test_service_allocate_by_model_excludes_keys_without_target_model_supp
 
     selected = await service.allocate_key_by_model("gpt-4o")
 
-    assert selected.id == "anthropic-supported"
+    assert selected.key.id == "anthropic-supported"
+    assert selected.provider_model == "gpt-4o"
     assert allocation_store.any_provider_ordered_ids == ["anthropic-supported"]
+
+
+@pytest.mark.anyio
+async def test_allocate_by_model_returns_provider_model_from_alias_mapping() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-openrouter",
+                provider="openrouter",
+                credential={"api_key": "sk-openrouter"},
+                supported_models=["openai/gpt-4o"],
+                last_used_at=now,
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openrouter", ["openai/gpt-4o"], available=True)),
+        model_alias_resolver=ModelAliasResolver.from_yaml_file(str(MODEL_ALIAS_VALID_PATH)),
+    )
+
+    selected = await service.allocate_key_by_model("gpt-4o")
+
+    assert selected.key.id == "key-openrouter"
+    assert selected.provider_model == "openai/gpt-4o"
+
+
+@pytest.mark.anyio
+async def test_allocate_key_falls_back_to_requested_model_when_alias_not_configured() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-openai",
+                provider="openai",
+                credential={"api_key": "sk-openai"},
+                supported_models=["gpt-4o-mini"],
+                last_used_at=now,
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o-mini"], available=True)),
+        model_alias_resolver=ModelAliasResolver.empty(),
+    )
+
+    selected = await service.allocate_key("openai", "gpt-4o-mini")
+
+    assert selected.key.id == "key-openai"
+    assert selected.provider_model == "gpt-4o-mini"
 
 
 @pytest.mark.anyio
@@ -382,6 +455,54 @@ async def test_create_key_rejects_provider_that_is_not_ready() -> None:
                 credential={"secure_1psid": "a", "secure_1psidts": "b"},
             )
         )
+
+
+@pytest.mark.anyio
+async def test_create_key_skips_persist_when_upstream_root_unreachable() -> None:
+    repository = InMemoryKeyRepository()
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(
+            FakeProviderPlugin("openai", ["gpt-4o"], available=True, upstream_root_reachable=False)
+        ),
+    )
+
+    with pytest.raises(UpstreamUnreachableError):
+        await service.create_key(CreateKeyInput(provider="openai", credential={"api_key": "sk-new"}))
+
+    assert repository._keys == {}
+
+
+@pytest.mark.anyio
+async def test_update_key_skips_credential_change_when_upstream_root_unreachable() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-b",
+                provider="openai",
+                credential={"api_key": "sk-b"},
+            ),
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(
+            FakeProviderPlugin("openai", ["gpt-4o"], available=True, upstream_root_reachable=False)
+        ),
+    )
+
+    with pytest.raises(UpstreamUnreachableError):
+        await service.update_key("key-b", UpdateKeyInput(credential={"api_key": "sk-new"}))
+
+    assert repository._keys["key-b"].credential == {"api_key": "sk-b"}
 
 
 @pytest.mark.anyio

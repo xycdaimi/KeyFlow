@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-03
+@Description: Key 生命周期与分配应用服务
+"""
 from __future__ import annotations
 
 import logging
@@ -18,6 +24,7 @@ from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer
 from domain.services.state_machine import KeyStateMachine
 from domain.value_objects.key_status import KeyStatus
+from application.services.model_alias_resolver import ModelAliasResolver
 from infrastructure.plugins.base import ProviderRegistry
 
 logger = logging.getLogger(__name__)
@@ -43,6 +50,12 @@ class UpdateKeyInput:
     status: KeyStatus | None = None
 
 
+@dataclass(slots=True)
+class AllocationResult:
+    key: ApiKey
+    provider_model: str | None = None
+
+
 class KeyService:
     _ADMIN_WRITABLE_STATUSES = frozenset({KeyStatus.AVAILABLE, KeyStatus.DISABLED_ADMIN})
 
@@ -54,6 +67,7 @@ class KeyService:
         scorer: KeyScorer,
         state_machine: KeyStateMachine,
         provider_registry: ProviderRegistry,
+        model_alias_resolver: ModelAliasResolver | None = None,
         allocation_lease_seconds: int = 2,
         refresh_cache_seconds: int = 60,
     ) -> None:
@@ -63,6 +77,7 @@ class KeyService:
         self._scorer = scorer
         self._state_machine = state_machine
         self._provider_registry = provider_registry
+        self._model_alias_resolver = model_alias_resolver or ModelAliasResolver.empty()
         self._allocation_lease_seconds = max(allocation_lease_seconds, 1)
         self._refresh_cache_seconds = max(refresh_cache_seconds, 1)
 
@@ -75,6 +90,7 @@ class KeyService:
             raise DuplicateCredentialError(
                 f"credential already exists for provider {provider} (key_id={existing.id})"
             )
+        await plugin.verify_upstream_root_reachable()
         key = ApiKey(
             id=str(uuid4()),
             provider=provider,
@@ -97,6 +113,7 @@ class KeyService:
                 raise DuplicateCredentialError(
                     f"credential already exists for provider {key.provider} (key_id={existing.id})"
                 )
+            await plugin.verify_upstream_root_reachable()
             key.credential = data.credential
             await self._refresh_single_key(key, utcnow(), plugin=plugin)
             await self._sync_models(key, plugin=plugin)
@@ -137,12 +154,14 @@ class KeyService:
             raise KeyNotFoundError(f"key {key_id} not found for provider {provider}")
         return list(key.supported_models)
 
-    async def allocate_key(self, provider: str, model: str | None = None) -> ApiKey:
+    async def allocate_key(self, provider: str, model: str | None = None) -> AllocationResult:
         now = utcnow()
         provider = provider.strip().lower()
         keys = await self._repository.list_provider_keys(provider)
         await self._recover_ready_keys(keys, now)
-        candidates, capacity_by_key_id = await self._collect_candidates(keys, model, now)
+        candidates, capacity_by_key_id, provider_model_by_key_id = await self._collect_candidates(
+            keys, model, now
+        )
 
         ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
         if not ranked:
@@ -158,13 +177,15 @@ class KeyService:
         if allocated_id is None:
             raise NoAvailableKeyError("no available key")
 
-        return await self._finalize_allocation(ranked, allocated_id, now)
+        return await self._finalize_allocation(ranked, allocated_id, now, provider_model_by_key_id)
 
-    async def allocate_key_by_model(self, model: str) -> ApiKey:
+    async def allocate_key_by_model(self, model: str) -> AllocationResult:
         now = utcnow()
         keys = await self._repository.list_keys()
         await self._recover_ready_keys(keys, now)
-        candidates, capacity_by_key_id = await self._collect_candidates(keys, model, now)
+        candidates, capacity_by_key_id, provider_model_by_key_id = await self._collect_candidates(
+            keys, model, now
+        )
 
         ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
         if not ranked:
@@ -178,7 +199,7 @@ class KeyService:
         if allocated_id is None:
             raise NoAvailableKeyError("no available key")
 
-        return await self._finalize_allocation(ranked, allocated_id, now)
+        return await self._finalize_allocation(ranked, allocated_id, now, provider_model_by_key_id)
 
     async def _recover_ready_keys(self, keys: list[ApiKey], now: datetime) -> None:
         for key in keys:
@@ -198,16 +219,25 @@ class KeyService:
         keys: list[ApiKey],
         model: str | None,
         now: datetime,
-    ) -> tuple[list[ApiKey], dict[str, float | None]]:
+    ) -> tuple[list[ApiKey], dict[str, float | None], dict[str, str | None]]:
         """Use cached refresh freshness and key status. No plugin calls during allocation."""
         candidates: list[ApiKey] = []
         capacity_by_key_id: dict[str, float | None] = {}
+        provider_model_by_key_id: dict[str, str | None] = {}
 
         for key in keys:
             if not key.is_available(now):
                 continue
-            if model and key.supported_models and model not in key.supported_models:
-                continue
+
+            provider_model: str | None = None
+            if model:
+                provider_model = self._model_alias_resolver.resolve_provider_model(
+                    requested_model=model,
+                    provider=key.provider,
+                    supported_models=list(key.supported_models),
+                )
+                if provider_model is None:
+                    continue
 
             plugin = self._provider_registry.get(key.provider)
             if plugin is not None:
@@ -217,16 +247,18 @@ class KeyService:
             else:
                 capacity_by_key_id[key.id] = None
 
+            provider_model_by_key_id[key.id] = provider_model
             candidates.append(key)
 
-        return candidates, capacity_by_key_id
+        return candidates, capacity_by_key_id, provider_model_by_key_id
 
     async def _finalize_allocation(
         self,
         ranked: list,
         allocated_id: str,
         now: datetime,
-    ) -> ApiKey:
+        provider_model_by_key_id: dict[str, str | None],
+    ) -> AllocationResult:
         selected = next((item.key for item in ranked if item.key.id == allocated_id), None)
         if selected is None:
             selected = await self._get_required_key(allocated_id)
@@ -234,7 +266,10 @@ class KeyService:
         selected.mark_used(now)
         await self._repository.upsert_key(selected)
         await self._allocation_store.sync_key(selected, self._scorer.score(selected, now))
-        return selected
+        return AllocationResult(
+            key=selected,
+            provider_model=provider_model_by_key_id.get(selected.id),
+        )
 
     async def report_success(self, key_id: str, tokens_used: int = 0) -> ApiKey:
         now = utcnow()

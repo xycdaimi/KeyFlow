@@ -26,12 +26,14 @@ class KeyResponse(BaseModel):
 
 class AllocateResponse(BaseModel):
     key_id: str
+    provider_model: str | None
     credential: dict[str, str]
 
 
 class AllocateByModelResponse(BaseModel):
     key_id: str
     provider: str
+    provider_model: str
     credential: dict[str, str]
 
 

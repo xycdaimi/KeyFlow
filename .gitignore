@@ -8,7 +8,7 @@
 venv/
 ENV/
 env/
-
+config/model_aliases.yaml
 # worktrees
 .worktrees/
 

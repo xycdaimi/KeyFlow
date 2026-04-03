@@ -1,12 +1,37 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-03
+@Description: 供应商插件抽象基类与注册表
+"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
+import httpx
+
+from domain.exceptions.domain_exceptions import UpstreamUnreachableError
+
 PLUGIN_INTERFACE_VERSION = "1.0.0"
 ModelSource = Literal["remote", "static"]
 CredentialDict = dict[str, str]
+
+_UPSTREAM_ROOT_HTTP_TIMEOUT = httpx.Timeout(5.0)
+
+
+async def ensure_upstream_root_http_reachable(origin: str) -> None:
+    """GET ``{origin}/`` with no auth. Any HTTP response counts as reachable."""
+    root = origin.rstrip("/") + "/"
+    try:
+        async with httpx.AsyncClient(
+            timeout=_UPSTREAM_ROOT_HTTP_TIMEOUT,
+            follow_redirects=True,
+        ) as client:
+            await client.get(root)
+    except httpx.RequestError as exc:
+        raise UpstreamUnreachableError(root) from exc
 
 
 @dataclass(slots=True)
@@ -93,6 +118,13 @@ class ProviderPlugin(ABC):
         Return None when provider does not have reliable quota data.
         """
         return None
+
+    async def verify_upstream_root_reachable(self) -> None:
+        """Probe supplier root URL without credentials before persisting new credentials.
+
+        Default is a no-op (for tests or static-only plugins). Remote providers should override.
+        """
+        return
 
 
 class ProviderRegistry:

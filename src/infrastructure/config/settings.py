@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     app_version: str = Field(default="0.1.0", alias="APP_VERSION")
     api_prefix: str = Field(default="/api", alias="API_PREFIX")
     internal_api_key: str = Field(default="dev-internal-key", alias="INTERNAL_API_KEY")
+    model_alias_config_path: str | None = Field(default=None, alias="MODEL_ALIAS_CONFIG_PATH")
 
     database_read_url: str = Field(
         default="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",

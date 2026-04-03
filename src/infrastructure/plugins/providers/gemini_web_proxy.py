@@ -1,10 +1,18 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-03
+@Description: Gemini Web（Cookie / gemini-webapi）供应商插件
+"""
 from __future__ import annotations
 
 import logging
 
-from infrastructure.plugins.base import ProviderPlugin
+from infrastructure.plugins.base import ProviderPlugin, ensure_upstream_root_http_reachable
 
 logger = logging.getLogger(__name__)
+
+_GEMINI_WEB_ORIGIN = "https://gemini.google.com"
 
 _KNOWN_MODELS: list[str] = [
     "gemini-2.5-pro",
@@ -67,6 +75,9 @@ class GeminiWebProxyPlugin(ProviderPlugin):
 
     def is_plugin_ready(self) -> bool:
         return self._is_dependency_available()
+
+    async def verify_upstream_root_reachable(self) -> None:
+        await ensure_upstream_root_http_reachable(_GEMINI_WEB_ORIGIN)
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         """Return the static list of known Gemini Web models.

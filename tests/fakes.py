@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timedelta
 
 from domain.entities.api_key import ApiKey
+from domain.exceptions.domain_exceptions import UpstreamUnreachableError
 from infrastructure.plugins.base import CapacitySignal, ProviderPlugin, ProviderRegistry
 
 
@@ -159,11 +160,13 @@ class FakeProviderPlugin(ProviderPlugin):
         plugin_ready: bool = True,
         capacity_signal: CapacitySignal | None = None,
         capacity_by_credential: dict[tuple[tuple[str, str], ...], CapacitySignal | None] | None = None,
+        upstream_root_reachable: bool = True,
     ) -> None:
         self._name = name
         self._models = models or []
         self._available = available
         self._plugin_ready = plugin_ready
+        self._upstream_root_reachable = upstream_root_reachable
         self._capacity_signal = capacity_signal
         self._capacity_by_credential = capacity_by_credential or {}
         self.success_calls: list[tuple[dict[str, str], dict]] = []
@@ -188,6 +191,10 @@ class FakeProviderPlugin(ProviderPlugin):
 
     def is_plugin_ready(self) -> bool:
         return self._plugin_ready
+
+    async def verify_upstream_root_reachable(self) -> None:
+        if not self._upstream_root_reachable:
+            raise UpstreamUnreachableError(f"https://fake-{self._name}.test/")
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         return self._models

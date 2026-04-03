@@ -1,3 +1,11 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-03
+@Description: KeyFlow 领域层异常类型定义
+"""
+
+
 class DomainError(Exception):
     """Base error for KeyFlow domain."""
 
@@ -20,6 +28,10 @@ class ProviderNotFoundError(DomainError):
 
 class ProviderNotReadyError(DomainError):
     """Raised when the requested provider plugin is not ready for use."""
+
+
+class UpstreamUnreachableError(DomainError):
+    """Supplier base URL could not be reached (no credential used in the probe)."""
 
 
 class InvalidStateTransitionError(DomainError):

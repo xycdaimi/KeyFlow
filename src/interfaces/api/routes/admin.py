@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-03
+@Description: 管理端 API（Key / Provider 维护）
+"""
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -9,6 +15,7 @@ from domain.exceptions.domain_exceptions import (
     KeyNotFoundError,
     ProviderNotFoundError,
     ProviderNotReadyError,
+    UpstreamUnreachableError,
 )
 from infrastructure.config.settings import Settings
 from infrastructure.plugins.base import ProviderRegistry
@@ -64,6 +71,11 @@ async def create_key(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider_not_found") from exc
     except ProviderNotReadyError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="provider_not_ready") from exc
+    except UpstreamUnreachableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="upstream_unreachable",
+        ) from exc
     return CreateKeyResponse(status="ok", key_id=key.id)
 
 
@@ -117,6 +129,11 @@ async def update_key(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider_not_found") from exc
     except ProviderNotReadyError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="provider_not_ready") from exc
+    except UpstreamUnreachableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="upstream_unreachable",
+        ) from exc
     return OperationStatusResponse(status="ok")
 
 

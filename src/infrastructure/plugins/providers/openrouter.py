@@ -1,8 +1,14 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-03
+@Description: OpenRouter 聚合 API 供应商插件
+"""
 from __future__ import annotations
 
 import httpx
 
-from infrastructure.plugins.base import CapacitySignal, ProviderPlugin
+from infrastructure.plugins.base import CapacitySignal, ProviderPlugin, ensure_upstream_root_http_reachable
 
 _BASE_URL = "https://openrouter.ai"
 
@@ -44,6 +50,9 @@ class OpenRouterPlugin(ProviderPlugin):
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
         return credential["api_key"]
+
+    async def verify_upstream_root_reachable(self) -> None:
+        await ensure_upstream_root_http_reachable(_BASE_URL)
 
     @staticmethod
     def _remaining_budget(data: dict) -> float:

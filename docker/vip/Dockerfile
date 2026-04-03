@@ -1,4 +1,8 @@
+# VIP 池专用构建上下文：与 docker/src/Dockerfile 同源镜像逻辑，镜像打标便于与 src 实例区分。
 FROM python:3.13-slim-bookworm
+
+LABEL com.keyflow.pool="vip"
+LABEL com.keyflow.description="KeyFlow API/worker image for VIP key pool"
 
 WORKDIR /app
 

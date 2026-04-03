@@ -116,7 +116,7 @@ def attach_health_checkers(app: FastAPI, container: punq.Container) -> None:
                 await session.execute(text("SELECT 1"))
             return True, None
         except Exception as exc:
-            return False, str(exc)
+            return False, "检查数据库失败"#str(exc)
 
     async def check_redis() -> tuple[bool, str | None]:
         try:

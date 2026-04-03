@@ -122,3 +122,39 @@ scripts\stop_src.bat --volumes
 scripts\stop_redis.bat --volumes
 scripts\stop_postgre.bat --volumes
 ```
+
+## Model Alias Config
+
+KeyFlow can load canonical-to-provider model aliases from a YAML file.
+
+- Env var: `MODEL_ALIAS_CONFIG_PATH`
+- If not set: startup continues with empty alias mapping.
+- If set but file is missing / unreadable / invalid YAML: startup fails immediately.
+
+Example:
+
+```yaml
+version: 1
+models:
+  gpt-4o:
+    providers:
+      openai:
+        - gpt-4o
+      openrouter:
+        - openai/gpt-4o
+        - openai/gpt-4o-2024-11-20
+```
+
+Docker compose mount example:
+
+```yaml
+services:
+  keyflow-api:
+    environment:
+      MODEL_ALIAS_CONFIG_PATH: /config/model_aliases.yaml
+    volumes:
+      - ./config/model_aliases.yaml:/config/model_aliases.yaml:ro
+```
+
+When request payload includes `model`, allocation responses include `provider_model`.
+Use `provider_model` as the upstream provider-native model name.

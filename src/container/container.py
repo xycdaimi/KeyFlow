@@ -3,6 +3,7 @@ from __future__ import annotations
 import punq
 
 from application.services.key_service import KeyService
+from application.services.model_alias_resolver import ModelAliasResolver
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer, ScoreWeights
 from domain.services.state_machine import KeyStateMachine
@@ -54,6 +55,7 @@ def create_container(settings: Settings) -> punq.Container:
     provider_registry.register(GeminiPlugin())
     provider_registry.register(OpenRouterPlugin())
     provider_registry.register(GeminiWebProxyPlugin())
+    model_alias_resolver = ModelAliasResolver.from_yaml_file(settings.model_alias_config_path)
     service = KeyService(
         repository,
         allocation_store,
@@ -61,6 +63,7 @@ def create_container(settings: Settings) -> punq.Container:
         scorer,
         state_machine,
         provider_registry,
+        model_alias_resolver=model_alias_resolver,
         allocation_lease_seconds=settings.allocate_lease_seconds,
         refresh_cache_seconds=settings.refresh_cache_seconds,
     )
@@ -71,6 +74,7 @@ def create_container(settings: Settings) -> punq.Container:
     container.register(KeyScheduler, instance=scheduler)
     container.register(KeyStateMachine, instance=state_machine)
     container.register(ProviderRegistry, instance=provider_registry)
+    container.register(ModelAliasResolver, instance=model_alias_resolver)
     container.register(SqlAlchemyKeyRepository, instance=repository)
     container.register(RedisKeyCache, instance=allocation_store)
     container.register(KeyService, instance=service)

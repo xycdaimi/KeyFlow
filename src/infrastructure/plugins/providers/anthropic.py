@@ -1,8 +1,14 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-03
+@Description: Anthropic Claude API 供应商插件
+"""
 from __future__ import annotations
 
 import httpx
 
-from infrastructure.plugins.base import ProviderPlugin
+from infrastructure.plugins.base import ProviderPlugin, ensure_upstream_root_http_reachable
 
 _BASE_URL = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -41,6 +47,9 @@ class AnthropicPlugin(ProviderPlugin):
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
         return credential["api_key"]
+
+    async def verify_upstream_root_reachable(self) -> None:
+        await ensure_upstream_root_http_reachable(_BASE_URL)
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         api_key = self._api_key(credential)
