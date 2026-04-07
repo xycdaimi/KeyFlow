@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-07
+@Description: API 路由与应用启动契约测试
+"""
 import asyncio
 import inspect
 import logging
@@ -9,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import punq
 from fastapi.testclient import TestClient
+from sqlalchemy.engine import make_url
 
 from application.services.key_service import AllocationResult, KeyService
 from application.services.model_alias_resolver import ModelAliasResolver
@@ -19,10 +26,14 @@ from domain.services.scorer import KeyScorer
 from domain.services.state_machine import KeyStateMachine
 from domain.value_objects.key_status import KeyStatus
 from infrastructure.config.settings import Settings
+from infrastructure.db.bootstrap import (
+    build_admin_url,
+    ensure_schema_ready,
+)
 from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
 from infrastructure.plugins.base import CapacitySignal, ProviderRegistry
 from interfaces.api import app as api_app_module
-from interfaces.api.app import create_app, ensure_schema_ready
+from interfaces.api.app import create_app
 from tests.fakes import FakeProviderPlugin, InMemoryAllocationStore, InMemoryKeyRepository, build_provider_registry
 
 
@@ -806,9 +817,15 @@ async def test_ensure_schema_ready_retries_transient_failures(monkeypatch: pytes
     async def _fake_sleep(_: int) -> None:
         return None
 
-    monkeypatch.setattr(api_app_module, "DB_SCHEMA_INIT_MAX_ATTEMPTS", 3)
-    monkeypatch.setattr(api_app_module, "DB_SCHEMA_INIT_RETRY_SECONDS", 0)
-    monkeypatch.setattr(api_app_module.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(
+        "infrastructure.db.bootstrap.DB_SCHEMA_INIT_MAX_ATTEMPTS",
+        3,
+    )
+    monkeypatch.setattr(
+        "infrastructure.db.bootstrap.DB_SCHEMA_INIT_RETRY_SECONDS",
+        0,
+    )
+    monkeypatch.setattr("infrastructure.db.bootstrap.asyncio.sleep", _fake_sleep)
 
     await ensure_schema_ready(_FakeEngine())
 
@@ -836,14 +853,104 @@ async def test_ensure_schema_ready_raises_after_retry_budget(monkeypatch: pytest
     async def _fake_sleep(_: int) -> None:
         return None
 
-    monkeypatch.setattr(api_app_module, "DB_SCHEMA_INIT_MAX_ATTEMPTS", 3)
-    monkeypatch.setattr(api_app_module, "DB_SCHEMA_INIT_RETRY_SECONDS", 0)
-    monkeypatch.setattr(api_app_module.asyncio, "sleep", _fake_sleep)
+    monkeypatch.setattr(
+        "infrastructure.db.bootstrap.DB_SCHEMA_INIT_MAX_ATTEMPTS",
+        3,
+    )
+    monkeypatch.setattr(
+        "infrastructure.db.bootstrap.DB_SCHEMA_INIT_RETRY_SECONDS",
+        0,
+    )
+    monkeypatch.setattr("infrastructure.db.bootstrap.asyncio.sleep", _fake_sleep)
 
     with pytest.raises(RuntimeError, match="db unavailable"):
         await ensure_schema_ready(_FakeEngine())
 
     assert attempts == 3
+
+
+def test_build_admin_url_switches_to_postgres_database() -> None:
+    admin_url, database_name = build_admin_url(
+        "postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow_app?sslmode=disable"
+    )
+
+    parsed = make_url(admin_url)
+    assert parsed.drivername == "postgresql"
+    assert parsed.database == "postgres"
+    assert parsed.query["sslmode"] == "disable"
+    assert database_name == "keyflow_app"
+
+
+@pytest.mark.anyio
+async def test_lifespan_bootstraps_only_write_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def _fake_bootstrap_write_database(database_url: str, write_engine) -> None:
+        observed["database_url"] = database_url
+        observed["engine"] = write_engine
+        return None
+
+    class _FakeConnection:
+        pass
+
+    class _FakeBegin:
+        async def __aenter__(self) -> _FakeConnection:
+            return _FakeConnection()
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    class _FakeEngine:
+        def begin(self) -> _FakeBegin:
+            return _FakeBegin()
+
+        async def dispose(self) -> None:
+            return None
+
+    class _FakeFactory:
+        def __init__(self, engine: _FakeEngine) -> None:
+            self.kw = {"bind": engine}
+
+    class _FakeRepository:
+        def __init__(self) -> None:
+            engine = _FakeEngine()
+            self._write_factory = _FakeFactory(engine)
+            self._read_factory = _FakeFactory(engine)
+
+    class _FakeRedis:
+        async def aclose(self) -> None:
+            return None
+
+    class _FakeRedisCache:
+        def __init__(self) -> None:
+            self._redis = _FakeRedis()
+
+    class _Container:
+        def __init__(self) -> None:
+            self._repository = _FakeRepository()
+            self._cache = _FakeRedisCache()
+
+        def resolve(self, dependency):
+            if dependency is SqlAlchemyKeyRepository:
+                return self._repository
+            if dependency.__name__ == "RedisKeyCache":
+                return self._cache
+            raise AssertionError(f"unexpected dependency lookup: {dependency}")
+
+    settings = Settings(
+        DATABASE_URL_READ="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow_read",
+        DATABASE_URL_WRITE="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow_write",
+    )
+    app = SimpleNamespace(state=SimpleNamespace(container=_Container(), settings=settings))
+
+    monkeypatch.setattr(api_app_module, "bootstrap_write_database", _fake_bootstrap_write_database)
+
+    async with api_app_module.lifespan(app):
+        pass
+
+    assert observed["database_url"] == "postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow_write"
 
 
 @pytest.mark.anyio
@@ -883,10 +990,7 @@ async def test_lifespan_reraises_unexpected_resolution_errors() -> None:
 async def test_api_lifespan_does_not_start_background_loop(monkeypatch: pytest.MonkeyPatch) -> None:
     called = False
 
-    async def _fake_ensure_schema_ready(_engine) -> None:
-        return None
-
-    async def _fake_ensure_refresh_columns(_conn) -> None:
+    async def _fake_bootstrap_write_database(_database_url: str, _engine) -> None:
         return None
 
     class _FakeTask:
@@ -946,6 +1050,8 @@ async def test_api_lifespan_does_not_start_background_loop(monkeypatch: pytest.M
 
     class _FakeSettings:
         background_task_interval_seconds = 23
+        database_read_url = "postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow"
+        database_write_url = "postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow"
 
     class _Container:
         def __init__(self) -> None:
@@ -965,11 +1071,10 @@ async def test_api_lifespan_does_not_start_background_loop(monkeypatch: pytest.M
                 return self._settings
             raise AssertionError(f"unexpected dependency lookup: {dependency}")
 
-    monkeypatch.setattr(api_app_module, "ensure_schema_ready", _fake_ensure_schema_ready)
-    monkeypatch.setattr(api_app_module, "ensure_refresh_columns", _fake_ensure_refresh_columns)
+    monkeypatch.setattr(api_app_module, "bootstrap_write_database", _fake_bootstrap_write_database)
     monkeypatch.setattr(api_app_module.asyncio, "create_task", _fake_create_task)
 
-    app = SimpleNamespace(state=SimpleNamespace(container=_Container()))
+    app = SimpleNamespace(state=SimpleNamespace(container=_Container(), settings=_FakeSettings()))
 
     async with api_app_module.lifespan(app):
         pass

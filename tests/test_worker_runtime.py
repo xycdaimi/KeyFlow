@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-03-20
+@Date: 2026-04-07
 @Description: Sidecar worker runtime 契约测试
 """
 from __future__ import annotations

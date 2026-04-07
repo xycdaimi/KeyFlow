@@ -1,12 +1,12 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-03-20
+@Date: 2026-04-07
 @Description: FastAPI 应用工厂与生命周期资源管理
 """
 from __future__ import annotations
 
-import asyncio
+# import asyncio
 from contextlib import asynccontextmanager
 import logging
 
@@ -18,7 +18,7 @@ from sqlalchemy import text
 from container.container import create_container
 from infrastructure.cache.key_cache import RedisKeyCache
 from infrastructure.config.settings import Settings, get_settings
-from infrastructure.db.models import Base
+from infrastructure.db.bootstrap import bootstrap_write_database
 from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
 from interfaces.api.routes.admin import router as admin_router
 from interfaces.api.routes.allocate import router as allocate_router
@@ -26,46 +26,6 @@ from interfaces.api.routes.health import router as health_router
 from interfaces.api.routes.report import router as report_router
 
 logger = logging.getLogger(__name__)
-DB_SCHEMA_INIT_MAX_ATTEMPTS = 5
-DB_SCHEMA_INIT_RETRY_SECONDS = 2
-
-
-async def ensure_schema_ready(write_engine) -> None:
-    for attempt in range(1, DB_SCHEMA_INIT_MAX_ATTEMPTS + 1):
-        try:
-            async with write_engine.begin() as connection:
-                await connection.run_sync(Base.metadata.create_all)
-            logger.info("event=db_schema_ready source=api_startup attempt=%s", attempt)
-            return
-        except Exception as exc:
-            if attempt >= DB_SCHEMA_INIT_MAX_ATTEMPTS:
-                logger.exception(
-                    "event=db_schema_init_failed source=api_startup attempts=%s error=%s",
-                    attempt,
-                    exc,
-                )
-                raise
-            logger.warning(
-                "event=db_schema_init_retry source=api_startup attempt=%s max_attempts=%s retry_in_seconds=%s error=%s",
-                attempt,
-                DB_SCHEMA_INIT_MAX_ATTEMPTS,
-                DB_SCHEMA_INIT_RETRY_SECONDS,
-                exc,
-            )
-            await asyncio.sleep(DB_SCHEMA_INIT_RETRY_SECONDS)
-
-
-async def ensure_refresh_columns(conn) -> None:
-    """Add refresh/cache columns if missing."""
-    for col, sql_type in [
-        ("last_refreshed_at", "TIMESTAMP WITH TIME ZONE"),
-        ("cached_available", "BOOLEAN"),
-        ("cached_quota_available", "BOOLEAN"),
-        ("cached_capacity_score", "DOUBLE PRECISION"),
-    ]:
-        await conn.execute(
-            text(f"ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS {col} {sql_type}")
-        )
 
 
 @asynccontextmanager
@@ -84,12 +44,10 @@ async def lifespan(app: FastAPI):
     write_engine = repository._write_factory.kw["bind"]
     read_engine = repository._read_factory.kw["bind"]
 
-    # Startup schema guard:
-    # create_all() only creates missing tables; existing tables are left intact.
-    await ensure_schema_ready(write_engine)
-
-    async with write_engine.begin() as conn:
-        await ensure_refresh_columns(conn)
+    await bootstrap_write_database(
+        app.state.settings.database_write_url,
+        write_engine,
+    )
 
     try:
         yield

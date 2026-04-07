@@ -15,7 +15,7 @@ COPY scripts ./scripts
 
 RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" --trusted-host "${PIP_TRUSTED_HOST}" .
 
-EXPOSE ${PORT:-8000}
+EXPOSE ${PORT:-8001}
 
 # Shared image for both API and worker runtimes.
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --app-dir src --workers ${UVICORN_WORKERS:-1}"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8001} --app-dir src --workers ${UVICORN_WORKERS:-1}"]

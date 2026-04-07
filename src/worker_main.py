@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-03-20
+@Date: 2026-04-07
 @Description: Sidecar worker 进程入口
 """
 from __future__ import annotations
@@ -19,17 +19,19 @@ def build_worker_key_service(settings: Settings) -> KeyService:
     return container.resolve(KeyService)
 
 
-def main() -> None:
-    settings = get_settings()
+async def _run_worker(settings: Settings) -> None:
     key_service = build_worker_key_service(settings)
     stop_event = asyncio.Event()
-    asyncio.run(
-        run_worker_loop(
-            key_service,
-            settings.background_task_interval_seconds,
-            stop_event,
-        )
+    await run_worker_loop(
+        key_service,
+        settings.background_task_interval_seconds,
+        stop_event,
     )
+
+
+def main() -> None:
+    settings = get_settings()
+    asyncio.run(_run_worker(settings))
 
 
 if __name__ == "__main__":
