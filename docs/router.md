@@ -4,8 +4,27 @@
 
 - 应用默认 API 前缀为 `/api`，可通过环境变量 `API_PREFIX` 覆盖。
 - 健康检查接口不走 `/api` 前缀。
-- `/api/internal/*` 路由需要请求头 `X-Internal-Key`，其值需与 `INTERNAL_API_KEY` 一致。
-- 管理类接口当前代码中未额外做鉴权，调用方需要自行放在受保护环境中。
+- **`/api/internal/*` 与全部 `/api/providers/*`、`/api/keys/*` 管理类接口**均需要请求头 `X-Internal-Key`，其值需与环境变量 `INTERNAL_API_KEY` 一致；缺失或不匹配时返回 `401`。
+- 除上述范围外，本文档未列出的接口请以代码为准。
+
+### HTTP 状态与 `detail` 约定
+
+业务错误统一为 JSON：`{"detail": "<字符串码>"}`（与 FastAPI `HTTPException` 一致）。常见取值如下。
+
+| 状态码 | 典型 `detail` | 说明 |
+| --- | --- | --- |
+| `401` | `invalid internal key` | `X-Internal-Key` 未传或与配置不一致 |
+| `404` | `no_available_key` | 当前没有可分配的 Key（候选为空或租约层未分配到） |
+| `404` | `key_not_found` | 指定 `key_id` 不存在，或与路径中的 `provider` 不匹配 |
+| `404` | `provider_not_found` | 未注册的 `provider`（多见于创建/更新 Key） |
+| `409` | `duplicate_credential` | 同一 `provider` 下已存在相同凭据内容 |
+| `409` | `provider_not_ready` | 插件未就绪（如依赖未安装），无法创建/更新该供应商的 Key |
+| `503` | `upstream_unreachable` | 创建/更新凭据时探测供应商根地址失败 |
+| `422` | （结构体） | 请求体字段类型、必填项或枚举不合法时，由 FastAPI/Pydantic 返回标准校验 `detail`（多为数组） |
+
+说明：`404` + `no_available_key` 表示**资源池层面**暂无可分配项，并非 REST 意义上的「URL 路径不存在」。
+
+`GET /health` 不使用 Internal Key；依赖未就绪时返回 **`503`**，响应体为 `{"status":"degraded","checks":{...}}`，见下文。
 
 ## 路由清单
 
@@ -35,13 +54,33 @@
 
 无路径参数、无请求体、无鉴权要求。
 
-**成功返回示例**
+**成功返回示例**（全部检查通过，HTTP `200`）
 
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "checks": {
+    "app": { "status": "ok", "detail": null },
+    "database": { "status": "ok", "detail": null },
+    "redis": { "status": "ok", "detail": null }
+  }
 }
 ```
+
+**降级示例**（任一项检查失败或未配置，HTTP **`503`**）
+
+```json
+{
+  "status": "degraded",
+  "checks": {
+    "app": { "status": "ok", "detail": null },
+    "database": { "status": "error", "detail": "检查数据库失败" },
+    "redis": { "status": "error", "detail": "Connection refused" }
+  }
+}
+```
+
+`checks` 中各组件的 `detail` 随运行环境变化，以实际响应为准。
 
 ## 2. `POST /api/internal/allocate-key`
 
@@ -89,7 +128,8 @@ X-Internal-Key: dev-internal-key
 **常见错误**
 
 - `401`: `{"detail": "invalid internal key"}`
-- `404`: `{"detail": "no_available_key"}`
+- `404`: `{"detail": "no_available_key"}`（当前无可分配 Key）
+- `422`: 请求体校验失败（例如缺少 `provider`、类型错误）
 
 ## 2.1 `POST /api/internal/allocate-by-model`
 
@@ -143,6 +183,7 @@ X-Internal-Key: dev-internal-key
 
 - `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "no_available_key"}`
+- `422`: 请求体校验失败（例如缺少 `model`）
 
 ## 3. `POST /api/internal/report-error`
 
@@ -191,6 +232,7 @@ X-Internal-Key: dev-internal-key
 
 - `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
+- `422`: 请求体校验失败（例如缺少 `key_id`、`error_type`）
 
 ## 4. `POST /api/internal/report-success`
 
@@ -239,12 +281,19 @@ X-Internal-Key: dev-internal-key
 
 - `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
+- `422`: 请求体校验失败（例如 `tokens_used` 为负数）
 
 ## 5. `POST /api/providers/{provider}/keys`
 
 **功能**
 
 为指定供应商新增一个凭据账号。创建时会先通过插件刷新可用性/容量缓存（`is_credential_available` / `get_capacity_signal`），再同步支持的模型列表（`fetch_models`），接口响应返回成功状态及新建 Key 的 `key_id`。
+
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
 
 **路径参数**
 
@@ -277,11 +326,26 @@ X-Internal-Key: dev-internal-key
 }
 ```
 
+**常见错误**
+
+- `401`: `{"detail": "invalid internal key"}`
+- `404`: `{"detail": "provider_not_found"}`（`provider` 未注册）
+- `409`: `{"detail": "duplicate_credential"}`（同供应商下凭据已存在）
+- `409`: `{"detail": "provider_not_ready"}`（插件依赖未满足等）
+- `503`: `{"detail": "upstream_unreachable"}`（探测供应商根地址失败）
+- `422`: 请求体校验失败（例如缺少 `credential` 或结构不符合约定）
+
 ## 6. `GET /api/providers/{provider}/keys`
 
 **功能**
 
-列出某个供应商下的所有 Key。返回数组中的每一项只包含 `key_id`、凭据本身和 `status`；没有数据时返回空数组。
+列出某个供应商下的所有 Key。返回数组中的每一项只包含 `key_id`、凭据本身和 `status`；没有数据时返回空数组。若 `provider` 在库中无任何 Key，返回 **`[]`**（HTTP `200`），**不会**因此返回 `404`。
+
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
 
 **路径参数**
 
@@ -303,10 +367,14 @@ X-Internal-Key: dev-internal-key
     "credential": {
       "api_key": "sk-new"
     },
-    "status": "available",
+    "status": "available"
   }
 ]
 ```
+
+**常见错误**
+
+- `401`: `{"detail": "invalid internal key"}`
 
 ## 13. Status Contract
 
@@ -359,6 +427,12 @@ X-Internal-Key: dev-internal-key
 
 通过 `key_id` 获取某个 Key 的凭据内容和状态，只返回这两个字段。
 
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
+
 **路径参数**
 
 - `key_id`: Key 唯一标识
@@ -376,6 +450,7 @@ X-Internal-Key: dev-internal-key
 
 **常见错误**
 
+- `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
 
 ## 8. `PUT /api/keys/{key_id}`
@@ -383,6 +458,12 @@ X-Internal-Key: dev-internal-key
 **功能**
 
 更新某个 Key 的凭据或状态。若更新了凭据，会先刷新可用性/容量缓存，再重新同步支持模型列表；接口响应只返回成功或失败状态。
+
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
 
 **路径参数**
 
@@ -414,13 +495,25 @@ X-Internal-Key: dev-internal-key
 
 **常见错误**
 
+- `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
+- `404`: `{"detail": "provider_not_found"}`（Key 存在但关联的 provider 未注册等边界情况）
+- `409`: `{"detail": "duplicate_credential"}`
+- `409`: `{"detail": "provider_not_ready"}`
+- `503`: `{"detail": "upstream_unreachable"}`（更新凭据时上游探测失败）
+- `422`: 请求体校验失败（例如 `status` 只能为 `available` 或 `disabled_admin`）
 
 ## 9. `DELETE /api/keys/{key_id}`
 
 **功能**
 
 删除某个 Key，并从分配缓存中移除；接口响应只返回成功或失败状态。
+
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
 
 **路径参数**
 
@@ -436,6 +529,7 @@ X-Internal-Key: dev-internal-key
 
 **常见错误**
 
+- `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
 
 ## 10. `GET /api/providers/{provider}/keys/{key_id}/models`
@@ -443,6 +537,12 @@ X-Internal-Key: dev-internal-key
 **功能**
 
 通过供应商名称和 `key_id` 获取该 Key 当前已同步的可用模型列表。接口只返回模型名称列表。
+
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
 
 **路径参数**
 
@@ -462,13 +562,20 @@ X-Internal-Key: dev-internal-key
 
 **常见错误**
 
-- `404`: `{"detail": "key_not_found"}`
+- `401`: `{"detail": "invalid internal key"}`
+- `404`: `{"detail": "key_not_found"}`（含 `key_id` 存在但该 Key 不属于路径中的 `provider`）
 
 ## 11. `GET /api/keys/{key_id}/explain`
 
 **功能**
 
 返回插件生成的安全摘要，用于后台展示。该接口返回内容由具体 provider 插件决定，但约定不能暴露原始 credential。
+
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
 
 **路径参数**
 
@@ -498,13 +605,22 @@ X-Internal-Key: dev-internal-key
 
 **常见错误**
 
+- `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
+
+说明：Key 存在但无对应插件时，HTTP 仍为 `200`，响应体可能为 `{"provider":"...","status":"no_plugin"}` 等，见上文「成功返回示例」说明。
 
 ## 12. `GET /api/providers`
 
 **功能**
 
 列出当前系统已注册的 provider 插件元信息，用于前端或运维侧决定可新增哪些类型的 Key。
+
+**请求头**
+
+```http
+X-Internal-Key: <与 INTERNAL_API_KEY 一致>
+```
 
 当前代码里注册的 provider 为：
 
@@ -536,3 +652,7 @@ X-Internal-Key: dev-internal-key
   }
 ]
 ```
+
+**常见错误**
+
+- `401`: `{"detail": "invalid internal key"}`

@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-08
+@Description: 领域服务与分配逻辑回归测试
+"""
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +15,7 @@ from application.services.model_alias_resolver import ModelAliasResolver
 from domain.entities.api_key import ApiKey
 from domain.exceptions.domain_exceptions import (
     DuplicateCredentialError,
+    NoAvailableKeyError,
     ProviderNotFoundError,
     ProviderNotReadyError,
     UpstreamUnreachableError,
@@ -100,6 +107,62 @@ def test_scheduler_selects_highest_ranked_key() -> None:
 
     selected = scheduler.select_key([worse, better], now)
     assert selected.id == "better"
+
+
+def test_scheduler_prefers_fresh_key_over_equivalent_stale_key() -> None:
+    now = datetime.now(timezone.utc)
+    scorer = KeyScorer()
+    scheduler = KeyScheduler(scorer, jitter=0.0)
+    fresh = ApiKey(
+        id="fresh",
+        provider="openai",
+        credential={"api_key": "sk-fresh"},
+        last_used_at=now - timedelta(minutes=5),
+        last_refreshed_at=now,
+    )
+    stale = ApiKey(
+        id="stale",
+        provider="openai",
+        credential={"api_key": "sk-stale"},
+        last_used_at=now - timedelta(minutes=5),
+        last_refreshed_at=now - timedelta(seconds=120),
+    )
+
+    ranked = scheduler.rank_keys(
+        [stale, fresh],
+        now,
+        capacity_by_key_id={"fresh": 0.7, "stale": 0.7},
+    )
+
+    assert [item.key.id for item in ranked] == ["fresh", "stale"]
+
+
+def test_scheduler_prefers_stale_key_over_very_stale_key_when_other_signals_match() -> None:
+    now = datetime.now(timezone.utc)
+    scorer = KeyScorer()
+    scheduler = KeyScheduler(scorer, jitter=0.0)
+    stale = ApiKey(
+        id="stale",
+        provider="openai",
+        credential={"api_key": "sk-stale"},
+        last_used_at=now - timedelta(minutes=5),
+        last_refreshed_at=now - timedelta(seconds=120),
+    )
+    very_stale = ApiKey(
+        id="very-stale",
+        provider="openai",
+        credential={"api_key": "sk-very-stale"},
+        last_used_at=now - timedelta(minutes=5),
+        last_refreshed_at=now - timedelta(seconds=240),
+    )
+
+    ranked = scheduler.rank_keys(
+        [very_stale, stale],
+        now,
+        capacity_by_key_id={"stale": 0.7, "very-stale": 0.7},
+    )
+
+    assert [item.key.id for item in ranked] == ["stale", "very-stale"]
 
 
 def test_scorer_prefers_key_with_higher_capacity_signal() -> None:
@@ -200,6 +263,142 @@ async def test_service_allocate_by_model_prefers_best_key_across_providers() -> 
     assert selected.key.id == "openrouter-high"
     assert selected.provider_model == "gpt-4o"
     assert allocation_store.any_provider_ordered_ids == ["openrouter-high", "openai-low"]
+
+
+@pytest.mark.anyio
+async def test_allocate_key_includes_stale_supported_key_in_ranked_candidates() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="fresh-key",
+                provider="openai",
+                credential={"api_key": "sk-fresh"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.6,
+            ),
+            ApiKey(
+                id="stale-key",
+                provider="openai",
+                credential={"api_key": "sk-stale"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now - timedelta(seconds=120),
+                cached_available=True,
+                cached_capacity_score=0.6,
+            ),
+        ]
+    )
+    allocation_store = InMemoryAllocationStore()
+    scorer = KeyScorer()
+    scheduler = KeyScheduler(scorer, jitter=0.0)
+    service = KeyService(
+        repository,
+        allocation_store,
+        scheduler,
+        scorer,
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+        refresh_cache_seconds=60,
+    )
+
+    await service.allocate_key("openai", "gpt-4o")
+
+    assert allocation_store.allocate_calls == [("openai", ["fresh-key", "stale-key"])]
+
+
+@pytest.mark.anyio
+async def test_allocate_by_model_allows_stale_key_when_it_is_the_only_allocatable_candidate() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="disabled-openai",
+                provider="openai",
+                credential={"api_key": "sk-disabled"},
+                status=KeyStatus.DISABLED_ADMIN,
+                supported_models=["gpt-4o"],
+                last_refreshed_at=now,
+                cached_available=True,
+            ),
+            ApiKey(
+                id="stale-openrouter",
+                provider="openrouter",
+                credential={"api_key": "sk-stale"},
+                status=KeyStatus.AVAILABLE,
+                supported_models=["gpt-4o"],
+                last_refreshed_at=now - timedelta(seconds=120),
+                cached_available=True,
+                cached_capacity_score=0.4,
+            ),
+        ]
+    )
+    scorer = KeyScorer()
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(scorer, jitter=0.0),
+        scorer,
+        KeyStateMachine(),
+        build_provider_registry(
+            FakeProviderPlugin("openai", ["gpt-4o"], available=True),
+            FakeProviderPlugin("openrouter", ["gpt-4o"], available=True),
+        ),
+        refresh_cache_seconds=60,
+    )
+
+    selected = await service.allocate_key_by_model("gpt-4o")
+
+    assert selected.key.id == "stale-openrouter"
+    assert selected.provider_model == "gpt-4o"
+
+
+@pytest.mark.anyio
+async def test_allocate_key_tries_next_ranked_candidate_when_first_is_leased() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="fresh-first",
+                provider="openai",
+                credential={"api_key": "sk-first"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.8,
+            ),
+            ApiKey(
+                id="stale-second",
+                provider="openai",
+                credential={"api_key": "sk-second"},
+                supported_models=["gpt-4o"],
+                last_used_at=now - timedelta(minutes=5),
+                last_refreshed_at=now - timedelta(seconds=120),
+                cached_available=True,
+                cached_capacity_score=0.7,
+            ),
+        ]
+    )
+    allocation_store = InMemoryAllocationStore()
+    allocation_store.active_leases[("openai", "fresh-first")] = now + timedelta(seconds=10)
+    scorer = KeyScorer()
+    service = KeyService(
+        repository,
+        allocation_store,
+        KeyScheduler(scorer, jitter=0.0),
+        scorer,
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+        refresh_cache_seconds=60,
+    )
+
+    selected = await service.allocate_key("openai", "gpt-4o")
+
+    assert selected.key.id == "stale-second"
 
 
 @pytest.mark.anyio

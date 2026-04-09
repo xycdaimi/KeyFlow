@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
+@Date: 2026-04-08
 @Description: Key 生命周期与分配应用服务
 """
 from __future__ import annotations
@@ -208,19 +208,13 @@ class KeyService:
             if before != key.status:
                 await self._repository.upsert_key(key)
 
-    def _is_cache_fresh(self, key: ApiKey, now: datetime) -> bool:
-        """True if key has fresh cached availability/capacity (no plugin calls needed)."""
-        if key.last_refreshed_at is None:
-            return False
-        return (now - key.last_refreshed_at).total_seconds() < self._refresh_cache_seconds
-
     async def _collect_candidates(
         self,
         keys: list[ApiKey],
         model: str | None,
         now: datetime,
     ) -> tuple[list[ApiKey], dict[str, float | None], dict[str, str | None]]:
-        """Use cached refresh freshness and key status. No plugin calls during allocation."""
+        """Build allocatable candidates without provider probing during allocation."""
         candidates: list[ApiKey] = []
         capacity_by_key_id: dict[str, float | None] = {}
         provider_model_by_key_id: dict[str, str | None] = {}
@@ -241,8 +235,6 @@ class KeyService:
 
             plugin = self._provider_registry.get(key.provider)
             if plugin is not None:
-                if not self._is_cache_fresh(key, now):
-                    continue
                 capacity_by_key_id[key.id] = key.cached_capacity_score
             else:
                 capacity_by_key_id[key.id] = None

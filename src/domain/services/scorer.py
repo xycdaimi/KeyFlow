@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-08
+@Description: Key 评分器与刷新时效惩罚
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -16,6 +22,10 @@ class ScoreWeights:
     rate_limit: float = 0.05
     cooldown: float = 0.05
     capacity_unknown_fallback: float = 0.5
+    freshness_stale_penalty: float = 0.15
+    freshness_very_stale_penalty: float = 0.30
+    freshness_stale_after_seconds: int = 60
+    freshness_very_stale_after_seconds: int = 180
     idle_cap_seconds: int = 300
     error_cap: int = 10
 
@@ -23,6 +33,17 @@ class ScoreWeights:
 class KeyScorer:
     def __init__(self, weights: ScoreWeights | None = None) -> None:
         self.weights = weights or ScoreWeights()
+
+    def _freshness_penalty(self, key: ApiKey, now: datetime) -> float:
+        if key.last_refreshed_at is None:
+            return self.weights.freshness_very_stale_penalty
+
+        age_seconds = max((now - key.last_refreshed_at).total_seconds(), 0.0)
+        if age_seconds < self.weights.freshness_stale_after_seconds:
+            return 0.0
+        if age_seconds < self.weights.freshness_very_stale_after_seconds:
+            return self.weights.freshness_stale_penalty
+        return self.weights.freshness_very_stale_penalty
 
     def score(self, key: ApiKey, now: datetime, capacity_score: float | None = None) -> float:
         if key.status in {
@@ -62,4 +83,5 @@ class KeyScorer:
             - (self.weights.error * error_penalty)
             - (self.weights.rate_limit * rate_limit_penalty)
             - (self.weights.cooldown * cooldown_penalty)
+            - self._freshness_penalty(key, now)
         )

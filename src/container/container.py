@@ -14,13 +14,7 @@ from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
 from infrastructure.db.session import create_session_factory
 from infrastructure.logging.logger import configure_logging
 from infrastructure.plugins.base import ProviderRegistry
-from infrastructure.plugins.providers import (
-    AnthropicPlugin,
-    GeminiPlugin,
-    GeminiWebProxyPlugin,
-    OpenAIPlugin,
-    OpenRouterPlugin,
-)
+from infrastructure.plugins.providers import *
 
 
 def create_container(settings: Settings) -> punq.Container:
@@ -55,6 +49,7 @@ def create_container(settings: Settings) -> punq.Container:
     provider_registry.register(GeminiPlugin())
     provider_registry.register(OpenRouterPlugin())
     provider_registry.register(GeminiWebProxyPlugin())
+    provider_registry.register(CodeXPlugin())
     model_alias_resolver = ModelAliasResolver.from_yaml_file(settings.model_alias_config_path)
     service = KeyService(
         repository,

@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-07
+@Date: 2026-04-08
 @Description: API 路由与应用启动契约测试
 """
 import asyncio
@@ -471,6 +471,130 @@ def test_allocate_by_model_returns_provider_and_credential() -> None:
         "provider_model": "gpt-4o",
         "credential": {"api_key": "sk-test"},
     }
+
+
+def test_allocate_key_route_allows_stale_supported_key_when_it_is_only_provider_candidate() -> None:
+    now = datetime.now(timezone.utc)
+    client = build_test_client(
+        repository=InMemoryKeyRepository(
+            [
+                ApiKey(
+                    id="stale-only",
+                    provider="openai",
+                    credential={"api_key": "sk-stale"},
+                    supported_models=["gpt-4o"],
+                    status=KeyStatus.AVAILABLE,
+                    last_refreshed_at=now - timedelta(seconds=120),
+                    cached_available=True,
+                    cached_capacity_score=0.3,
+                ),
+                ApiKey(
+                    id="disabled-other",
+                    provider="openai",
+                    credential={"api_key": "sk-disabled"},
+                    supported_models=["gpt-4o"],
+                    status=KeyStatus.DISABLED_ADMIN,
+                    last_refreshed_at=now,
+                    cached_available=True,
+                    cached_capacity_score=0.9,
+                ),
+            ]
+        ),
+        plugins=[FakeProviderPlugin("openai", ["gpt-4o"], available=True)],
+    )
+
+    response = client.post(
+        "/api/internal/allocate-key",
+        json={"provider": "openai", "model": "gpt-4o"},
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["key_id"] == "stale-only"
+
+
+def test_allocate_by_model_route_allows_stale_supported_key_when_it_is_only_candidate() -> None:
+    now = datetime.now(timezone.utc)
+    client = build_cross_provider_client(
+        keys=[
+            ApiKey(
+                id="stale-only",
+                provider="openai",
+                credential={"api_key": "sk-stale"},
+                supported_models=["gpt-4o"],
+                status=KeyStatus.AVAILABLE,
+                last_refreshed_at=now - timedelta(seconds=120),
+                cached_available=True,
+                cached_capacity_score=0.3,
+            ),
+            ApiKey(
+                id="disabled-other",
+                provider="openrouter",
+                credential={"api_key": "sk-disabled"},
+                supported_models=["gpt-4o"],
+                status=KeyStatus.DISABLED_ADMIN,
+                last_refreshed_at=now,
+                cached_available=True,
+                cached_capacity_score=0.9,
+            ),
+        ],
+        plugins=[
+            FakeProviderPlugin("openai", ["gpt-4o"], available=True),
+            FakeProviderPlugin("openrouter", ["gpt-4o"], available=True),
+        ],
+    )
+
+    response = client.post(
+        "/api/internal/allocate-by-model",
+        json={"model": "gpt-4o"},
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["key_id"] == "stale-only"
+
+
+def test_allocate_by_model_route_prefers_fresh_candidate_over_equivalent_stale_candidate() -> None:
+    now = datetime.now(timezone.utc)
+    allocation_store = InMemoryAllocationStore()
+    client = build_test_client(
+        repository=InMemoryKeyRepository(
+            [
+                ApiKey(
+                    id="fresh-key",
+                    provider="openai",
+                    credential={"api_key": "sk-fresh"},
+                    supported_models=["gpt-4o"],
+                    last_used_at=now - timedelta(minutes=5),
+                    last_refreshed_at=now,
+                    cached_available=True,
+                    cached_capacity_score=0.5,
+                ),
+                ApiKey(
+                    id="stale-key",
+                    provider="openai",
+                    credential={"api_key": "sk-stale"},
+                    supported_models=["gpt-4o"],
+                    last_used_at=now - timedelta(minutes=5),
+                    last_refreshed_at=now - timedelta(seconds=120),
+                    cached_available=True,
+                    cached_capacity_score=0.5,
+                ),
+            ]
+        ),
+        plugins=[FakeProviderPlugin("openai", ["gpt-4o"], available=True)],
+        allocation_store=allocation_store,
+    )
+
+    response = client.post(
+        "/api/internal/allocate-by-model",
+        json={"model": "gpt-4o"},
+        headers=ADMIN_HEADERS,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["key_id"] == "fresh-key"
+    assert client.app.state.test_allocation_store.any_provider_ordered_ids == ["fresh-key", "stale-key"]
 
 
 def test_allocate_by_model_returns_provider_model_from_alias() -> None:

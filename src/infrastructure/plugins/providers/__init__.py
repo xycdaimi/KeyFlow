@@ -3,6 +3,7 @@ from infrastructure.plugins.providers.gemini import GeminiPlugin
 from infrastructure.plugins.providers.gemini_web_proxy import GeminiWebProxyPlugin
 from infrastructure.plugins.providers.openai import OpenAIPlugin
 from infrastructure.plugins.providers.openrouter import OpenRouterPlugin
+from infrastructure.plugins.providers.codex import CodeXPlugin
 
 __all__ = [
     "AnthropicPlugin",
@@ -10,4 +11,5 @@ __all__ = [
     "GeminiWebProxyPlugin",
     "OpenAIPlugin",
     "OpenRouterPlugin",
+    "CodeXPlugin",
 ]
