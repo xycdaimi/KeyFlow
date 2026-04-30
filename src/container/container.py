@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-27
+@Description: 应用依赖注入容器
+"""
 from __future__ import annotations
 
 import punq
@@ -46,10 +52,15 @@ def create_container(settings: Settings) -> punq.Container:
     provider_registry = ProviderRegistry()
     provider_registry.register(OpenAIPlugin())
     provider_registry.register(AnthropicPlugin())
+    provider_registry.register(AntigravityOpenAiPlugin())
+    provider_registry.register(AntigravityOauthPlugin())
     provider_registry.register(GeminiPlugin())
+    provider_registry.register(GeminiOauthPlugin())
+    provider_registry.register(GeminiOpenAiPlugin())
     provider_registry.register(OpenRouterPlugin())
     provider_registry.register(GeminiWebProxyPlugin())
-    provider_registry.register(CodeXPlugin())
+    provider_registry.register(CodexOpenAiPlugin())
+    provider_registry.register(CodexOauthPlugin())
     model_alias_resolver = ModelAliasResolver.from_yaml_file(settings.model_alias_config_path)
     service = KeyService(
         repository,

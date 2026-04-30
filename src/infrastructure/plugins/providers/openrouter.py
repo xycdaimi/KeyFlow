@@ -1,14 +1,14 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
-@Description: OpenRouter 聚合 API 供应商插件
+@Date: 2026-04-16
+@Description: OpenRouter provider plugin
 """
 from __future__ import annotations
 
 import httpx
 
-from infrastructure.plugins.base import CapacitySignal, ProviderPlugin, ensure_upstream_root_http_reachable
+from infrastructure.plugins.base import CapacitySignal, EgressMode, ProviderPlugin
 
 _BASE_URL = "https://openrouter.ai"
 
@@ -17,27 +17,13 @@ class OpenRouterPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
-    """Plugin for OpenRouter.
-
-    Credential availability: key is valid/reachable.
-    Quota availability: exposed via get_capacity_signal.
-
-    Internal billing logic:
-        - Queries /api/v1/auth/key for (limit, usage).
-        - Available only when remaining = limit - usage > 0 (or free tier).
-        - All billing detail is private; the core only sees bool.
-    """
-
     @property
     def name(self) -> str:
         return "openrouter"
 
     @property
     def description(self) -> str:
-        return (
-            "OpenRouter 聚合 API（openrouter.ai），支持多家模型厂商。"
-            "可用性取决于 API Key 有效且账户剩余额度大于 0（免费套餐除外）。"
-        )
+        return "OpenRouter API at openrouter.ai."
 
     @property
     def auth_type(self) -> str:
@@ -45,14 +31,18 @@ class OpenRouterPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "sk-or-..."}（OpenRouter API Key，Bearer 令牌）'
+        return '{"api_key": "sk-or-..."} (OpenRouter API Key, Bearer token)'
+
+    @property
+    def egress_mode(self) -> EgressMode:
+        return "proxy"
 
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
         return credential["api_key"]
 
     async def verify_upstream_root_reachable(self) -> None:
-        await ensure_upstream_root_http_reachable(_BASE_URL)
+        await self._ensure_upstream_root_http_reachable(_BASE_URL, httpx.AsyncClient)
 
     @staticmethod
     def _remaining_budget(data: dict) -> float:
@@ -69,15 +59,15 @@ class OpenRouterPlugin(ProviderPlugin):
 
     async def get_capacity_signal(self, credential: dict[str, str]) -> CapacitySignal | None:
         api_key = self._api_key(credential)
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
+        async with self._build_http_client(httpx.AsyncClient) as client:
+            response = await client.get(
                 f"{_BASE_URL}/api/v1/auth/key",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
-            if not r.is_success:
+            if not response.is_success:
                 return None
 
-            data = r.json().get("data", {})
+            data = response.json().get("data", {})
             limit = float(data.get("limit") or 0)
             remaining = self._remaining_budget(data)
             score = 1.0 if limit <= 0 else min(max(remaining / limit, 0.0), 1.0)
@@ -91,35 +81,34 @@ class OpenRouterPlugin(ProviderPlugin):
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         api_key = self._api_key(credential)
-        async with httpx.AsyncClient(timeout=15) as client:
-            r = await client.get(
+        async with self._build_http_client(httpx.AsyncClient) as client:
+            response = await client.get(
                 f"{_BASE_URL}/api/v1/models",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
-            r.raise_for_status()
-            return [item["id"] for item in r.json().get("data", [])]
+            response.raise_for_status()
+            return [item["id"] for item in response.json().get("data", [])]
 
-    async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
-        """Available when the credential itself is valid/reachable."""
+    async def is_credential_available(self, credential: dict[str, str]) -> bool:
         api_key = self._api_key(credential)
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
+        async with self._build_http_client(httpx.AsyncClient) as client:
+            response = await client.get(
                 f"{_BASE_URL}/api/v1/auth/key",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
-            if r.status_code in (401, 403):
+            if response.status_code in (401, 403):
                 return False
             return True
 
     async def explain_credential(self, credential: dict[str, str]) -> dict:
         api_key = self._api_key(credential)
         masked_credential = api_key[:8] + "***"
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
+        async with self._build_http_client(httpx.AsyncClient) as client:
+            response = await client.get(
                 f"{_BASE_URL}/api/v1/auth/key",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
-            if not r.is_success:
+            if not response.is_success:
                 return {
                     "provider": self.name,
                     "status": "unknown",
@@ -127,7 +116,7 @@ class OpenRouterPlugin(ProviderPlugin):
                     "auth_type": "bearer_api_key",
                     "credential_hint": masked_credential,
                 }
-            data = r.json().get("data", {})
+            data = response.json().get("data", {})
             return {
                 "provider": self.name,
                 "status": "ok",

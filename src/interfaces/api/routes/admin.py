@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
+@Date: 2026-04-27
 @Description: 管理端 API（Key / Provider 维护）
 """
 from typing import Annotated
@@ -12,9 +12,11 @@ from application.services.key_service import CreateKeyInput, KeyService, UpdateK
 from domain.entities.api_key import ApiKey
 from domain.exceptions.domain_exceptions import (
     DuplicateCredentialError,
+    InvalidCredentialError,
     KeyNotFoundError,
     ProviderNotFoundError,
     ProviderNotReadyError,
+    RuntimeLockUnavailableError,
     UpstreamUnreachableError,
 )
 from infrastructure.config.settings import Settings
@@ -76,6 +78,8 @@ async def create_key(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="upstream_unreachable",
         ) from exc
+    except InvalidCredentialError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return CreateKeyResponse(status="ok", key_id=key.id)
 
 
@@ -129,11 +133,15 @@ async def update_key(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="provider_not_found") from exc
     except ProviderNotReadyError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="provider_not_ready") from exc
+    except RuntimeLockUnavailableError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="key_runtime_locked") from exc
     except UpstreamUnreachableError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="upstream_unreachable",
         ) from exc
+    except InvalidCredentialError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     return OperationStatusResponse(status="ok")
 
 
@@ -171,11 +179,11 @@ async def list_providers(
     """列出系统中所有已注册的供应商插件及其认证信息。
 
     - name: 供应商标识符，调用其他接口时用作 {provider} 路径参数
-    - description: 供应商说明（API 类型、计费方式、可用性判断依据等）
-    - auth_type: 认证方式（bearer_api_key / header_api_key / cookie）
-    - credential_hint: 凭据格式说明（添加 key 时填入 credential 字段的 JSON 结构）
-    - model_source: 模型列表来源（remote=从供应商 API 拉取 / static=内置固定列表）
-    - available: 插件运行时依赖是否已满足（False 表示缺少依赖，该供应商无法分配）
+    - description: 供应商说明
+    - auth_type: 认证方式
+    - credential_hint: 凭证格式说明
+    - model_source: 供应商实现来源（remote=外部 API / 服务，static=本地 SDK / 本地代码实现）
+    - available: 插件运行时依赖是否已满足
     """
     return [
         ProviderInfoResponse(

@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
+@Date: 2026-04-27
 @Description: KeyFlow 领域层异常类型定义
 """
 
@@ -20,6 +20,14 @@ class KeyNotFoundError(DomainError):
 
 class DuplicateCredentialError(DomainError):
     """Raised when the same credential already exists for the provider."""
+
+
+class InvalidCredentialError(DomainError):
+    """Raised when the submitted credential payload is invalid."""
+
+
+class RuntimeLockUnavailableError(DomainError):
+    """Raised when a key runtime snapshot is being refreshed by another owner."""
 
 
 class ProviderNotFoundError(DomainError):

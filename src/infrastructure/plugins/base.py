@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
+@Date: 2026-04-23
 @Description: 供应商插件抽象基类与注册表
 """
 from __future__ import annotations
@@ -13,25 +13,29 @@ from typing import Literal
 import httpx
 
 from domain.exceptions.domain_exceptions import UpstreamUnreachableError
+from infrastructure.config.settings import get_settings
 
 PLUGIN_INTERFACE_VERSION = "1.0.0"
 ModelSource = Literal["remote", "static"]
 CredentialDict = dict[str, str]
+EgressMode = Literal["direct", "proxy"]
 
-_UPSTREAM_ROOT_HTTP_TIMEOUT = httpx.Timeout(5.0)
+_UPSTREAM_ROOT_TIMEOUT_SECONDS = 5.0
+_UPSTREAM_ROOT_HTTP_TIMEOUT = httpx.Timeout(_UPSTREAM_ROOT_TIMEOUT_SECONDS)
 
 
-async def ensure_upstream_root_http_reachable(origin: str) -> None:
-    """GET ``{origin}/`` with no auth. Any HTTP response counts as reachable."""
-    root = origin.rstrip("/") + "/"
-    try:
-        async with httpx.AsyncClient(
-            timeout=_UPSTREAM_ROOT_HTTP_TIMEOUT,
-            follow_redirects=True,
-        ) as client:
-            await client.get(root)
-    except httpx.RequestError as exc:
-        raise UpstreamUnreachableError(root) from exc
+def build_provider_http_timeout(total_timeout: float | None = None) -> httpx.Timeout:
+    settings = get_settings()
+    total = settings.http_total_timeout if total_timeout is None else max(total_timeout, 0.1)
+    connect = max(settings.http_connect_timeout, 0.1)
+    read = max(settings.http_read_timeout, 0.1)
+    return httpx.Timeout(
+        total,
+        connect=connect,
+        read=read,
+        write=read,
+        pool=connect,
+    )
 
 
 @dataclass(slots=True)
@@ -41,6 +45,12 @@ class CapacitySignal:
     quota_available: bool | None = None
     capacity_kind: str = "unknown"
     reason: str = ""
+
+
+@dataclass(slots=True)
+class CredentialPreparationResult:
+    credential: CredentialDict
+    changed: bool = False
 
 
 class ProviderPlugin(ABC):
@@ -83,19 +93,69 @@ class ProviderPlugin(ABC):
 
     @property
     def model_source(self) -> ModelSource:
-        """Where fetch_models comes from: remote API or static table."""
+        """Where provider execution comes from.
+
+        - remote: external API / service
+        - static: local SDK / local code implementation
+        """
         return "remote"
+
+    @property
+    def egress_mode(self) -> EgressMode:
+        """Outbound network policy used by this provider plugin."""
+        return "direct"
 
     def is_plugin_ready(self) -> bool:
         """Return True if plugin runtime dependencies are satisfied."""
         return True
+
+    def _proxy_url(self) -> str | None:
+        settings = get_settings()
+        if self.egress_mode != "proxy":
+            return None
+        proxy = (settings.global_http_proxy or "").strip()
+        if not proxy:
+            return None
+        return proxy
+
+    def _build_http_client(
+        self,
+        client_factory,
+        *,
+        total_timeout: float | None = None,
+        follow_redirects: bool = False,
+        **kwargs,
+    ):
+        proxy = self._proxy_url()
+        client_kwargs = {
+            "timeout": build_provider_http_timeout(total_timeout),
+            **kwargs,
+        }
+        if follow_redirects:
+            client_kwargs["follow_redirects"] = True
+        if proxy:
+            client_kwargs["proxy"] = proxy
+        return client_factory(**client_kwargs)
+
+    async def _ensure_upstream_root_http_reachable(self, origin: str, client_factory) -> None:
+        """GET ``{origin}/`` with no auth. Any HTTP response counts as reachable."""
+        root = origin.rstrip("/") + "/"
+        try:
+            async with self._build_http_client(
+                client_factory,
+                total_timeout=_UPSTREAM_ROOT_HTTP_TIMEOUT.connect,
+                follow_redirects=True,
+            ) as client:
+                await client.get(root)
+        except httpx.RequestError as exc:
+            raise UpstreamUnreachableError(root) from exc
 
     @abstractmethod
     async def fetch_models(self, credential: CredentialDict) -> list[str]:
         """Return model IDs available for this credential."""
 
     @abstractmethod
-    async def is_credential_available(self, credential: CredentialDict, model: str | None = None) -> bool:
+    async def is_credential_available(self, credential: CredentialDict) -> bool:
         """Return True if credential itself is valid and reachable now.
 
         This signal should not mix quota depletion semantics.
@@ -125,6 +185,14 @@ class ProviderPlugin(ABC):
         Default is a no-op (for tests or static-only plugins). Remote providers should override.
         """
         return
+
+    async def prepare_credential(self, credential: CredentialDict) -> CredentialPreparationResult:
+        """Return the locally normalized credential to persist.
+
+        This hook is used by registration/update flows. Implementations must not perform
+        remote IO, token refresh, runtime project discovery, or quota probing here.
+        """
+        return CredentialPreparationResult(credential=credential, changed=False)
 
 
 class ProviderRegistry:

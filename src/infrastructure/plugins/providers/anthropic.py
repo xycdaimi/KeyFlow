@@ -1,14 +1,14 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
-@Description: Anthropic Claude API 供应商插件
+@Date: 2026-04-16
+@Description: Anthropic provider plugin
 """
 from __future__ import annotations
 
 import httpx
 
-from infrastructure.plugins.base import ProviderPlugin, ensure_upstream_root_http_reachable
+from infrastructure.plugins.base import EgressMode, ProviderPlugin
 
 _BASE_URL = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -18,23 +18,13 @@ class AnthropicPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
-    """Plugin for Anthropic Claude.
-
-    Availability: key is valid when the models endpoint returns 200.
-    Anthropic does not expose a public balance API; availability is based
-    solely on authentication success.
-    """
-
     @property
     def name(self) -> str:
         return "anthropic"
 
     @property
     def description(self) -> str:
-        return (
-            "Anthropic Claude API（api.anthropic.com）。"
-            "可用性取决于 API Key 是否通过身份验证（Anthropic 无公开余额查询接口）。"
-        )
+        return "Anthropic Claude API at api.anthropic.com."
 
     @property
     def auth_type(self) -> str:
@@ -42,33 +32,37 @@ class AnthropicPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "sk-ant-..."}（Anthropic API Key）'
+        return '{"api_key": "sk-ant-..."} (Anthropic API Key)'
+
+    @property
+    def egress_mode(self) -> EgressMode:
+        return "proxy"
 
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
         return credential["api_key"]
 
     async def verify_upstream_root_reachable(self) -> None:
-        await ensure_upstream_root_http_reachable(_BASE_URL)
+        await self._ensure_upstream_root_http_reachable(_BASE_URL, httpx.AsyncClient)
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         api_key = self._api_key(credential)
         model_ids: list[str] = []
         after_id: str | None = None
 
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with self._build_http_client(httpx.AsyncClient) as client:
             while True:
                 params: dict[str, str | int] = {"limit": 100}
                 if after_id:
                     params["after_id"] = after_id
 
-                r = await client.get(
+                response = await client.get(
                     f"{_BASE_URL}/v1/models",
                     headers={"x-api-key": api_key, "anthropic-version": _ANTHROPIC_VERSION},
                     params=params,
                 )
-                r.raise_for_status()
-                body = r.json()
+                response.raise_for_status()
+                body = response.json()
                 for item in body.get("data", []):
                     model_ids.append(item["id"])
                 if not body.get("has_more"):
@@ -79,18 +73,17 @@ class AnthropicPlugin(ProviderPlugin):
 
         return model_ids
 
-    async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
-        """Available when the API key authenticates successfully."""
+    async def is_credential_available(self, credential: dict[str, str]) -> bool:
         api_key = self._api_key(credential)
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
+        async with self._build_http_client(httpx.AsyncClient) as client:
+            response = await client.get(
                 f"{_BASE_URL}/v1/models",
                 headers={"x-api-key": api_key, "anthropic-version": _ANTHROPIC_VERSION},
                 params={"limit": 1},
             )
-            if r.status_code in (401, 403):
+            if response.status_code in (401, 403):
                 return False
-            return True  # 200 or transient error → keep available
+            return True
 
     async def explain_credential(self, credential: dict[str, str]) -> dict:
         api_key = self._api_key(credential)

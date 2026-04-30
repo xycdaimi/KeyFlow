@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-08
+@Date: 2026-04-21
 @Description: Key 评分器与刷新时效惩罚
 """
 from __future__ import annotations
@@ -47,6 +47,7 @@ class KeyScorer:
 
     def score(self, key: ApiKey, now: datetime, capacity_score: float | None = None) -> float:
         if key.status in {
+            KeyStatus.PENDING,
             KeyStatus.DISABLED_UPSTREAM,
             KeyStatus.DISABLED_ADMIN,
             KeyStatus.DISABLED_REPORT,

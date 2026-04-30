@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-07
+@Date: 2026-04-27
 @Description: PostgreSQL 写库启动引导
 """
 from __future__ import annotations
@@ -72,13 +72,27 @@ async def ensure_schema_ready(write_engine) -> None:
 async def ensure_refresh_columns(conn) -> None:
     for col, sql_type in [
         ("last_refreshed_at", "TIMESTAMP WITH TIME ZONE"),
+        ("updated_at", "TIMESTAMP WITH TIME ZONE"),
         ("cached_available", "BOOLEAN"),
         ("cached_quota_available", "BOOLEAN"),
         ("cached_capacity_score", "DOUBLE PRECISION"),
+        ("runtime_lock_owner", "VARCHAR(128)"),
+        ("runtime_lock_until", "TIMESTAMP WITH TIME ZONE"),
+        ("runtime_lock_reason", "VARCHAR(64)"),
     ]:
         await conn.execute(
             text(f"ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS {col} {sql_type}")
         )
+
+
+async def ensure_credential_uniqueness(conn) -> None:
+    await conn.execute(text("DROP INDEX IF EXISTS uq_api_keys_provider_credential"))
+    await conn.execute(
+        text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_api_keys_provider_credential "
+            "ON api_keys (provider, (md5((credential::jsonb)::text)))"
+        )
+    )
 
 
 async def bootstrap_write_database(database_url: str, write_engine) -> None:
@@ -86,3 +100,4 @@ async def bootstrap_write_database(database_url: str, write_engine) -> None:
     await ensure_schema_ready(write_engine)
     async with write_engine.begin() as conn:
         await ensure_refresh_columns(conn)
+        await ensure_credential_uniqueness(conn)

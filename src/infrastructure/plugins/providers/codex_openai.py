@@ -2,7 +2,7 @@
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
 @Date: 2026-04-16
-@Description: OpenAI provider plugin
+@Description: CodeX 官方 API 供应商插件
 """
 from __future__ import annotations
 
@@ -10,21 +10,21 @@ import httpx
 
 from infrastructure.plugins.base import CapacitySignal, EgressMode, ProviderPlugin
 
-_ROOT_ORIGIN = "https://api.openai.com"
+_ROOT_ORIGIN = "http://47.77.196.94:3000/openai-codex-oauth"
 _BASE_URL = f"{_ROOT_ORIGIN}/v1"
 
 
-class OpenAIPlugin(ProviderPlugin):
+class CodexOpenAiPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
     @property
     def name(self) -> str:
-        return "openai"
+        return "codex_openai"
 
     @property
     def description(self) -> str:
-        return "OpenAI official API at api.openai.com."
+        return "CodeX official API at http://47.77.196.94:3000/openai-codex-oauth."
 
     @property
     def auth_type(self) -> str:
@@ -32,11 +32,11 @@ class OpenAIPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "sk-..."} (OpenAI API Key, Bearer token)'
+        return '{"api_key": "sk-..."} (CodeX API Key, Bearer token)'
 
     @property
     def egress_mode(self) -> EgressMode:
-        return "proxy"
+        return "direct"
 
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
@@ -86,6 +86,7 @@ class OpenAIPlugin(ProviderPlugin):
             return [item["id"] for item in response.json().get("data", [])]
 
     async def is_credential_available(self, credential: dict[str, str]) -> bool:
+        """Credential-level availability only."""
         api_key = self._api_key(credential)
         async with self._build_http_client(httpx.AsyncClient) as client:
             response = await client.get(

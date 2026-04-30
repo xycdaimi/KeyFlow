@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from domain.entities.api_key import ApiKey
 from domain.value_objects.key_status import KeyStatus
@@ -11,30 +11,13 @@ class KeyStateMachine:
         self._rate_limit_backoff_minutes = rate_limit_backoff_minutes
 
     def on_success(self, key: ApiKey, tokens_used: int, now: datetime) -> ApiKey:
-        if key.status == KeyStatus.DISABLED_ADMIN:
-            return key
-        key.register_success(tokens_used=tokens_used, now=now)
+        key.success_count += 1
+        key.quota_used += max(tokens_used, 0)
+        key.last_used_at = now
         return key
 
     def on_error(self, key: ApiKey, error_type: str, now: datetime) -> ApiKey:
-        normalized = error_type.strip().lower()
         key.register_error(now=now)
-
-        if normalized == "rate_limit":
-            step = min(max(key.error_count - 1, 0), len(self._rate_limit_backoff_minutes) - 1)
-            key.status = KeyStatus.RATE_LIMITED
-            key.cooldown_until = now + timedelta(minutes=self._rate_limit_backoff_minutes[step])
-            return key
-
-        if normalized == "quota_exhausted":
-            key.status = KeyStatus.EXHAUSTED
-            return key
-
-        if normalized == "disabled":
-            key.status = KeyStatus.DISABLED_REPORT
-            return key
-
-        key.status = KeyStatus.AVAILABLE
         return key
 
     def recover_if_ready(self, key: ApiKey, now: datetime) -> ApiKey:

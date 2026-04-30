@@ -42,7 +42,7 @@ async def test_worker_runtime_runs_recover_then_refresh_once() -> None:
             calls.append("recover")
             return 1
 
-        async def refresh_keys(self, model=None) -> int:
+        async def refresh_keys(self) -> int:
             calls.append("refresh")
             return 1
 
@@ -65,7 +65,7 @@ async def test_worker_runtime_logs_phase_and_continues_when_recover_fails(
             calls.append("recover")
             raise RuntimeError("recover failed")
 
-        async def refresh_keys(self, model=None) -> int:
+        async def refresh_keys(self) -> int:
             calls.append("refresh")
             return 1
 

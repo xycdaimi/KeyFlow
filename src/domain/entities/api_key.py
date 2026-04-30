@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-21
+@Description: API Key 领域实体
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -37,6 +43,8 @@ class ApiKey:
     supported_models: list = field(default_factory=list)
     last_refreshed_at: datetime | None = None
     """Last time this key's availability/capacity was refreshed by the background task."""
+    updated_at: datetime | None = None
+    """Last time this key record was modified in storage."""
     cached_available: bool | None = None
     """Cached credential-level availability from plugin. None = not yet refreshed."""
     cached_quota_available: bool | None = None
@@ -60,6 +68,7 @@ class ApiKey:
     def is_available(self, now: datetime | None = None) -> bool:
         current = now or utcnow()
         if self.status in {
+            KeyStatus.PENDING,
             KeyStatus.DISABLED_UPSTREAM,
             KeyStatus.DISABLED_ADMIN,
             KeyStatus.DISABLED_REPORT,

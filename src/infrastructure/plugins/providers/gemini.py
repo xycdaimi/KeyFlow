@@ -1,14 +1,14 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
-@Description: Google Gemini 官方 API 供应商插件
+@Date: 2026-04-16
+@Description: Google Gemini official API provider plugin
 """
 from __future__ import annotations
 
 import httpx
 
-from infrastructure.plugins.base import ProviderPlugin, ensure_upstream_root_http_reachable
+from infrastructure.plugins.base import EgressMode, ProviderPlugin
 
 _BASE_URL = "https://generativelanguage.googleapis.com"
 
@@ -17,23 +17,13 @@ class GeminiPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
-    """Plugin for Google Gemini (generativelanguage API / AI Studio).
-
-    Availability: key is valid when the models endpoint returns 200.
-    Google does not expose a per-key credit balance API; availability
-    is based solely on authentication success.
-    """
-
     @property
     def name(self) -> str:
         return "gemini"
 
     @property
     def description(self) -> str:
-        return (
-            "Google Gemini 官方 API（generativelanguage.googleapis.com / AI Studio）。"
-            "可用性取决于 API Key 是否通过身份验证（Google 无公开的 per-key 余额接口）。"
-        )
+        return "Google Gemini official API at generativelanguage.googleapis.com."
 
     @property
     def auth_type(self) -> str:
@@ -41,14 +31,18 @@ class GeminiPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "AIza..."}（Google AI Studio API Key）'
+        return '{"api_key": "AIza..."} (Google AI Studio API Key)'
+
+    @property
+    def egress_mode(self) -> EgressMode:
+        return "proxy"
 
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
         return credential["api_key"]
 
     async def verify_upstream_root_reachable(self) -> None:
-        await ensure_upstream_root_http_reachable(_BASE_URL)
+        await self._ensure_upstream_root_http_reachable(_BASE_URL, httpx.AsyncClient)
 
     @staticmethod
     def _availability_status(response: httpx.Response) -> str:
@@ -78,15 +72,15 @@ class GeminiPlugin(ProviderPlugin):
             if page_token:
                 params["pageToken"] = page_token
 
-            r = await client.get(
+            response = await client.get(
                 f"{_BASE_URL}/v1beta/models",
                 headers={"x-goog-api-key": api_key},
                 params=params,
             )
-            if not r.is_success:
+            if not response.is_success:
                 return None
 
-            body = r.json()
+            body = response.json()
             for item in body.get("models", []):
                 raw_name = str(item.get("name") or "")
                 model_id = raw_name.removeprefix("models/")
@@ -105,19 +99,19 @@ class GeminiPlugin(ProviderPlugin):
         model_ids: list[str] = []
         page_token: str | None = None
 
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with self._build_http_client(httpx.AsyncClient) as client:
             while True:
                 params: dict[str, str | int] = {"pageSize": 100}
                 if page_token:
                     params["pageToken"] = page_token
 
-                r = await client.get(
+                response = await client.get(
                     f"{_BASE_URL}/v1beta/models",
                     headers={"x-goog-api-key": api_key},
                     params=params,
                 )
-                r.raise_for_status()
-                body = r.json()
+                response.raise_for_status()
+                body = response.json()
 
                 for item in body.get("models", []):
                     raw_name: str = item.get("name", "")
@@ -131,15 +125,14 @@ class GeminiPlugin(ProviderPlugin):
 
         return model_ids
 
-    async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
-        """Gemini availability is based on whether a minimal inference request works."""
+    async def is_credential_available(self, credential: dict[str, str]) -> bool:
         api_key = self._api_key(credential)
-        async with httpx.AsyncClient(timeout=10) as client:
-            probe_model = model or await self._select_probe_model(client, api_key)
+        async with self._build_http_client(httpx.AsyncClient) as client:
+            probe_model = await self._select_probe_model(client, api_key)
             if not probe_model:
                 return False
 
-            r = await client.post(
+            response = await client.post(
                 f"{_BASE_URL}/v1beta/{self._normalize_model_name(probe_model)}:generateContent",
                 headers={"x-goog-api-key": api_key},
                 json={
@@ -147,7 +140,7 @@ class GeminiPlugin(ProviderPlugin):
                     "generationConfig": {"maxOutputTokens": 1},
                 },
             )
-            return self._availability_status(r) == "AVAILABLE"
+            return self._availability_status(response) == "AVAILABLE"
 
     async def explain_credential(self, credential: dict[str, str]) -> dict:
         api_key = self._api_key(credential)

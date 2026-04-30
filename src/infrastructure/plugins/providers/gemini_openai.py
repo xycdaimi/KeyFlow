@@ -1,30 +1,30 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
-@Description: CodeX 官方 API 供应商插件
+@Date: 2026-04-21
+@Description: Gemini CLI OpenAI 兼容 API 提供商插件
 """
 from __future__ import annotations
 
 import httpx
 
-from infrastructure.plugins.base import CapacitySignal, ProviderPlugin, ensure_upstream_root_http_reachable
+from infrastructure.plugins.base import CapacitySignal, EgressMode, ProviderPlugin
 
-_ROOT_ORIGIN = "http://47.77.196.94:3000/openai-codex-oauth"
+_ROOT_ORIGIN = "http://47.77.196.94:3000/gemini-cli-oauth"
 _BASE_URL = f"{_ROOT_ORIGIN}/v1"
 
 
-class CodeXPlugin(ProviderPlugin):
+class GeminiOpenAiPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
     @property
     def name(self) -> str:
-        return "codex"
+        return "gemini_openai"
 
     @property
     def description(self) -> str:
-        return "CodeX official API at http://47.77.196.94:3000/openai-codex-oauth."
+        return "Gemini CLI OpenAI-compatible API at http://47.77.196.94:3000/gemini-cli-oauth."
 
     @property
     def auth_type(self) -> str:
@@ -32,14 +32,18 @@ class CodeXPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "sk-..."} (CodeX API Key, Bearer token)'
+        return '{"api_key": "sk-..."} (Gemini CLI API Key, Bearer token)'
+
+    @property
+    def egress_mode(self) -> EgressMode:
+        return "direct"
 
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
         return credential["api_key"]
 
     async def verify_upstream_root_reachable(self) -> None:
-        await ensure_upstream_root_http_reachable(_ROOT_ORIGIN)
+        await self._ensure_upstream_root_http_reachable(_ROOT_ORIGIN, httpx.AsyncClient)
 
     @staticmethod
     def _error_payload_text(response: httpx.Response) -> str:
@@ -73,7 +77,7 @@ class CodeXPlugin(ProviderPlugin):
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         api_key = self._api_key(credential)
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with self._build_http_client(httpx.AsyncClient) as client:
             response = await client.get(
                 f"{_BASE_URL}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -81,10 +85,9 @@ class CodeXPlugin(ProviderPlugin):
             response.raise_for_status()
             return [item["id"] for item in response.json().get("data", [])]
 
-    async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
-        """Credential-level availability only."""
+    async def is_credential_available(self, credential: dict[str, str]) -> bool:
         api_key = self._api_key(credential)
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with self._build_http_client(httpx.AsyncClient) as client:
             response = await client.get(
                 f"{_BASE_URL}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
@@ -96,7 +99,7 @@ class CodeXPlugin(ProviderPlugin):
     async def get_capacity_signal(self, credential: dict[str, str]) -> CapacitySignal | None:
         api_key = self._api_key(credential)
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
+            async with self._build_http_client(httpx.AsyncClient) as client:
                 response = await client.get(
                     f"{_BASE_URL}/models",
                     headers={"Authorization": f"Bearer {api_key}"},

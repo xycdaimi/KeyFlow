@@ -1,14 +1,16 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-03
+@Date: 2026-04-22
 @Description: Gemini Web（Cookie / gemini-webapi）供应商插件
 """
 from __future__ import annotations
 
 import logging
 
-from infrastructure.plugins.base import ProviderPlugin, ensure_upstream_root_http_reachable
+import httpx
+
+from infrastructure.plugins.base import EgressMode, ProviderPlugin
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +68,10 @@ class GeminiWebProxyPlugin(ProviderPlugin):
     def model_source(self) -> str:
         return "static"
 
+    @property
+    def egress_mode(self) -> EgressMode:
+        return "proxy"
+
     def _is_dependency_available(self) -> bool:
         try:
             from gemini_webapi import GeminiClient  # type: ignore[import]
@@ -77,7 +83,7 @@ class GeminiWebProxyPlugin(ProviderPlugin):
         return self._is_dependency_available()
 
     async def verify_upstream_root_reachable(self) -> None:
-        await ensure_upstream_root_http_reachable(_GEMINI_WEB_ORIGIN)
+        await self._ensure_upstream_root_http_reachable(_GEMINI_WEB_ORIGIN, httpx.AsyncClient)
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         """Return the static list of known Gemini Web models.
@@ -86,7 +92,7 @@ class GeminiWebProxyPlugin(ProviderPlugin):
         """
         return list(_KNOWN_MODELS)
 
-    async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
+    async def is_credential_available(self, credential: dict[str, str]) -> bool:
         """Verify the cookie is still valid using the gemini_webapi library."""
         if not self._is_dependency_available():
             logger.warning(
@@ -102,6 +108,7 @@ class GeminiWebProxyPlugin(ProviderPlugin):
             client = GeminiClient(
                 secure_1psid=secure_1psid,
                 secure_1psidts=secure_1psidts,
+                proxy=self._proxy_url(),
             )
             await client.init(timeout=10, auto_close=True, close_delay=0)
             return True

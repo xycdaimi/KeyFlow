@@ -1,16 +1,38 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-27
+@Description: 测试用内存仓储与 Provider 假实现
+"""
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from domain.entities.api_key import ApiKey
-from domain.exceptions.domain_exceptions import UpstreamUnreachableError
+from domain.exceptions.domain_exceptions import DuplicateCredentialError, UpstreamUnreachableError
+from domain.value_objects.key_status import KeyStatus
 from infrastructure.plugins.base import CapacitySignal, ProviderPlugin, ProviderRegistry
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class InMemoryKeyRepository:
     def __init__(self, keys: list[ApiKey] | None = None) -> None:
         self._keys = {key.id: key for key in keys or []}
+        self._runtime_locks: dict[str, tuple[str, datetime, str]] = {}
+
+    def _assert_unique_provider_credential(self, key_id: str, provider: str, credential: dict[str, str]) -> None:
+        candidate = json.dumps(credential, sort_keys=True)
+        for existing in self._keys.values():
+            if existing.id == key_id or existing.provider != provider:
+                continue
+            if json.dumps(existing.credential, sort_keys=True) == candidate:
+                raise DuplicateCredentialError(
+                    f"credential already exists for provider {provider} (key_id={existing.id})"
+                )
 
     async def list_provider_keys(self, provider: str) -> list[ApiKey]:
         return [key for key in self._keys.values() if key.provider == provider]
@@ -34,8 +56,139 @@ class InMemoryKeyRepository:
         return None
 
     async def upsert_key(self, key: ApiKey) -> ApiKey:
+        self._assert_unique_provider_credential(key.id, key.provider, key.credential)
+        key.updated_at = utcnow()
         self._keys[key.id] = key
         return key
+
+    async def touch_key_used(self, key_id: str, now: datetime) -> ApiKey | None:
+        key = self._keys.get(key_id)
+        if key is None:
+            return None
+        key.last_used_at = now
+        key.updated_at = now
+        return key
+
+    async def record_success(self, key_id: str, tokens_used: int, now: datetime) -> ApiKey | None:
+        key = self._keys.get(key_id)
+        if key is None:
+            return None
+        key.success_count += 1
+        key.quota_used += max(tokens_used, 0)
+        key.last_used_at = now
+        key.updated_at = now
+        return key
+
+    async def record_error(self, key_id: str, now: datetime) -> ApiKey | None:
+        key = self._keys.get(key_id)
+        if key is None:
+            return None
+        key.error_count += 1
+        key.last_used_at = now
+        key.updated_at = now
+        return key
+
+    async def update_status(
+        self,
+        key_id: str,
+        status: str,
+        cooldown_until: datetime | None,
+        now: datetime,
+    ) -> ApiKey | None:
+        key = self._keys.get(key_id)
+        if key is None:
+            return None
+        key.status = KeyStatus(status)
+        key.cooldown_until = cooldown_until
+        key.updated_at = now
+        return key
+
+    async def acquire_runtime_lock(
+        self,
+        key_id: str,
+        owner: str,
+        now: datetime,
+        ttl_seconds: int,
+        reason: str,
+    ) -> bool:
+        if key_id not in self._keys:
+            return False
+        current = self._runtime_locks.get(key_id)
+        if current is not None:
+            current_owner, lock_until, _ = current
+            if lock_until > now and current_owner != owner:
+                return False
+        self._runtime_locks[key_id] = (
+            owner,
+            now + timedelta(seconds=max(ttl_seconds, 1)),
+            reason,
+        )
+        return True
+
+    async def release_runtime_lock(self, key_id: str, owner: str, now: datetime) -> None:
+        current = self._runtime_locks.get(key_id)
+        if current is None:
+            return
+        current_owner, _, _ = current
+        if current_owner == owner:
+            self._runtime_locks.pop(key_id, None)
+
+    async def update_runtime_snapshot_if_locked(
+        self,
+        key: ApiKey,
+        owner: str,
+        now: datetime,
+    ) -> ApiKey | None:
+        current_lock = self._runtime_locks.get(key.id)
+        if current_lock is None:
+            return None
+        current_owner, lock_until, _ = current_lock
+        if current_owner != owner or lock_until <= now:
+            return None
+        current = self._keys.get(key.id)
+        if current is None:
+            return None
+        self._assert_unique_provider_credential(key.id, key.provider, key.credential)
+        current.credential = dict(key.credential)
+        current.status = key.status
+        current.cooldown_until = key.cooldown_until
+        current.supported_models = list(key.supported_models)
+        current.last_refreshed_at = key.last_refreshed_at
+        current.cached_available = key.cached_available
+        current.cached_quota_available = key.cached_quota_available
+        current.cached_capacity_score = key.cached_capacity_score
+        current.updated_at = now
+        return current
+
+    async def update_background_runtime_snapshot_if_locked(
+        self,
+        key: ApiKey,
+        owner: str,
+        now: datetime,
+    ) -> ApiKey | None:
+        current_lock = self._runtime_locks.get(key.id)
+        if current_lock is None:
+            return None
+        current_owner, lock_until, _ = current_lock
+        if current_owner != owner or lock_until <= now:
+            return None
+        current = self._keys.get(key.id)
+        if current is None or current.status in {
+            KeyStatus.DISABLED_ADMIN,
+            KeyStatus.DISABLED_REPORT,
+        }:
+            return None
+        self._assert_unique_provider_credential(key.id, key.provider, key.credential)
+        current.credential = dict(key.credential)
+        current.status = key.status
+        current.cooldown_until = key.cooldown_until
+        current.supported_models = list(key.supported_models)
+        current.last_refreshed_at = key.last_refreshed_at
+        current.cached_available = key.cached_available
+        current.cached_quota_available = key.cached_quota_available
+        current.cached_capacity_score = key.cached_capacity_score
+        current.updated_at = now
+        return current
 
     async def delete_key(self, key_id: str) -> None:
         self._keys.pop(key_id, None)
@@ -58,19 +211,6 @@ class InMemoryKeyRepository:
         if provider:
             keys = [k for k in keys if k.provider == provider]
         return keys
-
-    async def claim_refresh(self, key_id: str, now: datetime, max_age_seconds: int) -> bool:
-        from datetime import timedelta
-
-        key = self._keys.get(key_id)
-        if key is None:
-            return False
-        cutoff = now - timedelta(seconds=max_age_seconds)
-        if key.last_refreshed_at is not None and key.last_refreshed_at >= cutoff:
-            return False
-        key.last_refreshed_at = now
-        return True
-
 
 class InMemoryAllocationStore:
     def __init__(self) -> None:
@@ -171,7 +311,7 @@ class FakeProviderPlugin(ProviderPlugin):
         self._capacity_by_credential = capacity_by_credential or {}
         self.success_calls: list[tuple[dict[str, str], dict]] = []
         self.error_calls: list[tuple[dict[str, str], dict]] = []
-        self.available_checks: list[tuple[dict[str, str], str | None]] = []
+        self.available_checks: list[dict[str, str]] = []
 
     @property
     def name(self) -> str:
@@ -199,8 +339,8 @@ class FakeProviderPlugin(ProviderPlugin):
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
         return self._models
 
-    async def is_credential_available(self, credential: dict[str, str], model: str | None = None) -> bool:
-        self.available_checks.append((credential, model))
+    async def is_credential_available(self, credential: dict[str, str]) -> bool:
+        self.available_checks.append(credential)
         return self._available
 
     async def mark_success(self, credential: dict[str, str], meta: dict | None = None) -> None:
@@ -221,6 +361,40 @@ class FakeProviderPlugin(ProviderPlugin):
         if key in self._capacity_by_credential:
             return self._capacity_by_credential[key]
         return self._capacity_signal
+
+
+class FakeOauthProviderPlugin(FakeProviderPlugin):
+    def __init__(
+        self,
+        name: str,
+        models: list[str] | None = None,
+        *,
+        fresh: bool = True,
+        refreshed_credential: dict[str, str] | None = None,
+        refresh_result: dict[str, str] | None = None,
+        available: bool = True,
+        capacity_signal: CapacitySignal | None = None,
+    ) -> None:
+        super().__init__(name, models, available=available, capacity_signal=capacity_signal)
+        self._fresh = fresh
+        self._refreshed_credential = refreshed_credential
+        self._refresh_result = refresh_result
+        self.fresh_checks: list[dict[str, str]] = []
+        self.refresh_calls: list[dict[str, str]] = []
+
+    @property
+    def auth_type(self) -> str:
+        return "oauth_json"
+
+    def _is_oauth_credential_fresh(self, credential: dict[str, str]) -> bool:
+        self.fresh_checks.append(dict(credential))
+        return self._fresh
+
+    async def _refresh_oauth_credential(self, credential: dict[str, str]) -> dict[str, str] | None:
+        self.refresh_calls.append(dict(credential))
+        if self._refresh_result is None:
+            return dict(self._refreshed_credential) if self._refreshed_credential is not None else None
+        return dict(self._refresh_result)
 
 
 def build_provider_registry(*plugins: ProviderPlugin) -> ProviderRegistry:

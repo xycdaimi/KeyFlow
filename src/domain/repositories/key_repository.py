@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-27
+@Description: Key 仓储协议定义
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -25,6 +31,61 @@ class KeyRepository(Protocol):
     async def upsert_key(self, key: ApiKey) -> ApiKey:
         ...
 
+    async def touch_key_used(self, key_id: str, now: datetime) -> ApiKey | None:
+        """Update allocation usage timestamp only."""
+        ...
+
+    async def record_success(self, key_id: str, tokens_used: int, now: datetime) -> ApiKey | None:
+        """Increment success priority fields without changing runtime/admin state."""
+        ...
+
+    async def record_error(self, key_id: str, now: datetime) -> ApiKey | None:
+        """Increment error priority fields without changing runtime/admin state."""
+        ...
+
+    async def update_status(
+        self,
+        key_id: str,
+        status: str,
+        cooldown_until: datetime | None,
+        now: datetime,
+    ) -> ApiKey | None:
+        """Update status-owned fields only."""
+        ...
+
+    async def acquire_runtime_lock(
+        self,
+        key_id: str,
+        owner: str,
+        now: datetime,
+        ttl_seconds: int,
+        reason: str,
+    ) -> bool:
+        """Acquire per-key runtime snapshot write lock."""
+        ...
+
+    async def release_runtime_lock(self, key_id: str, owner: str, now: datetime) -> None:
+        """Release per-key runtime snapshot write lock when still owned by owner."""
+        ...
+
+    async def update_runtime_snapshot_if_locked(
+        self,
+        key: ApiKey,
+        owner: str,
+        now: datetime,
+    ) -> ApiKey | None:
+        """Persist explicit runtime mutation when owner still holds the lock."""
+        ...
+
+    async def update_background_runtime_snapshot_if_locked(
+        self,
+        key: ApiKey,
+        owner: str,
+        now: datetime,
+    ) -> ApiKey | None:
+        """Persist background runtime refresh only if owner holds the lock and key is not admin/report disabled."""
+        ...
+
     async def delete_key(self, key_id: str) -> None:
         ...
 
@@ -35,11 +96,6 @@ class KeyRepository(Protocol):
         self, cutoff: datetime, provider: str | None = None
     ) -> list[ApiKey]:
         """List keys whose last_refreshed_at is None or older than cutoff."""
-        ...
-
-    async def claim_refresh(self, key_id: str, now: datetime, max_age_seconds: int) -> bool:
-        """Atomically claim the right to refresh this key. Returns True if claimed.
-        Prevents duplicate refresh across multiple processes."""
         ...
 
 

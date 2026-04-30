@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-28
+@Description: 模型别名解析服务
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -52,20 +58,33 @@ class ModelAliasResolver:
         provider: str,
         supported_models: list[str],
     ) -> str | None:
-        normalized_model = requested_model.strip().lower()
+        requested_model = requested_model.strip()
+        normalized_model = requested_model.lower()
         normalized_provider = provider.strip().lower()
         configured_aliases = self.aliases_by_model.get(normalized_model, {}).get(normalized_provider)
 
+        supported_lookup = {model.lower(): model for model in supported_models}
         if configured_aliases is None:
-            if supported_models and requested_model not in supported_models:
+            if supported_models and normalized_model not in supported_lookup:
                 return None
-            return requested_model
+            if not supported_models:
+                return requested_model
+            return supported_lookup[normalized_model]
 
         if not supported_models:
             return configured_aliases[0]
 
-        supported_lookup = {model.lower(): model for model in supported_models}
-        for alias in configured_aliases:
+        aliases = [requested_model, *configured_aliases]
+        deduped_aliases: list[str] = []
+        seen_aliases: set[str] = set()
+        for alias in aliases:
+            normalized_alias = alias.lower()
+            if normalized_alias in seen_aliases:
+                continue
+            seen_aliases.add(normalized_alias)
+            deduped_aliases.append(alias)
+
+        for alias in deduped_aliases:
             matched = supported_lookup.get(alias.lower())
             if matched is not None:
                 return matched

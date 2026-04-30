@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-16
+@Description: 应用运行时配置
+"""
 from functools import lru_cache
 
 from pydantic import Field
@@ -42,6 +48,12 @@ class Settings(BaseSettings):
     """Cache validity. Keys with last_refreshed_at within this window use cached availability."""
     background_task_interval_seconds: int = Field(default=60, alias="BACKGROUND_TASK_INTERVAL_SECONDS")
     """Interval for recover_cooldowns and refresh_keys background task."""
+    global_http_proxy: str | None = Field(default=None, alias="GLOBAL_HTTP_PROXY")
+    """Fixed HTTP proxy used by provider plugins whose egress mode is proxy."""
+    http_connect_timeout: float = Field(default=3.0, alias="HTTP_CONNECT_TIMEOUT")
+    http_read_timeout: float = Field(default=8.0, alias="HTTP_READ_TIMEOUT")
+    http_total_timeout: float = Field(default=12.0, alias="HTTP_TOTAL_TIMEOUT")
+    """Default HTTP timeout settings for provider plugin upstream calls."""
 
 
 @lru_cache(maxsize=1)

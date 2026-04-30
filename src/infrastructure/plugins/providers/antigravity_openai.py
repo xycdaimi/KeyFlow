@@ -1,8 +1,8 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-16
-@Description: OpenAI provider plugin
+@Date: 2026-04-27
+@Description: Gemini Antigravity OpenAI 兼容 API 提供商插件
 """
 from __future__ import annotations
 
@@ -10,21 +10,21 @@ import httpx
 
 from infrastructure.plugins.base import CapacitySignal, EgressMode, ProviderPlugin
 
-_ROOT_ORIGIN = "https://api.openai.com"
+_ROOT_ORIGIN = "http://47.77.196.94:3000/gemini-antigravity"
 _BASE_URL = f"{_ROOT_ORIGIN}/v1"
 
 
-class OpenAIPlugin(ProviderPlugin):
+class AntigravityOpenAiPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
     @property
     def name(self) -> str:
-        return "openai"
+        return "antigravity_openai"
 
     @property
     def description(self) -> str:
-        return "OpenAI official API at api.openai.com."
+        return "Gemini Antigravity OpenAI-compatible API at http://47.77.196.94:3000/gemini-antigravity."
 
     @property
     def auth_type(self) -> str:
@@ -32,11 +32,11 @@ class OpenAIPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "sk-..."} (OpenAI API Key, Bearer token)'
+        return '{"api_key": "sk-..."} (Gemini Antigravity API Key, Bearer token)'
 
     @property
     def egress_mode(self) -> EgressMode:
-        return "proxy"
+        return "direct"
 
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:

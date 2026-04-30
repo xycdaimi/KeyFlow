@@ -1,8 +1,14 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-04-27
+@Description: SQLAlchemy 数据库模型
+"""
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String
+from sqlalchemy import JSON, DateTime, Float, Index, Integer, String, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -12,6 +18,14 @@ class Base(DeclarativeBase):
 
 class ApiKeyModel(Base):
     __tablename__ = "api_keys"
+    __table_args__ = (
+        Index(
+            "uq_api_keys_provider_credential",
+            "provider",
+            text("(md5((credential::jsonb)::text))"),
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(64), index=True)
@@ -28,9 +42,17 @@ class ApiKeyModel(Base):
     """Model IDs fetched at registration. Informational only."""
     last_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     """Last time availability/capacity was refreshed. Used to avoid duplicate refresh across processes."""
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    """Last time this row was modified."""
     cached_available: Mapped[bool | None] = mapped_column(nullable=True)
     """Cached credential-level availability result. None = not yet refreshed."""
     cached_quota_available: Mapped[bool | None] = mapped_column(nullable=True)
     """Cached quota availability result. None = unknown."""
     cached_capacity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     """Cached capacity score from plugin. None = unknown."""
+    runtime_lock_owner: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    """Owner token for runtime snapshot refresh lock."""
+    runtime_lock_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    """Expiration time for runtime snapshot refresh lock."""
+    runtime_lock_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    """Human-readable runtime lock reason for debugging."""

@@ -32,6 +32,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from domain.entities.api_key import ApiKey
+from domain.exceptions.domain_exceptions import DuplicateCredentialError
 from domain.value_objects.key_status import KeyStatus
 from infrastructure.db.models import Base
 from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
@@ -135,12 +136,12 @@ async def test_upsert_and_get_round_trip_structured_fields(
 
 
 @pytest.mark.asyncio
-async def test_claim_refresh_concurrent_only_one_wins(
+async def test_runtime_lock_concurrent_only_one_wins(
     pg_repository: SqlAlchemyKeyRepository,
 ) -> None:
     key_id = f"it-{uuid.uuid4().hex}"
     now = datetime(2025, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
-    max_age = 3600
+    ttl_seconds = 3600
 
     await pg_repository.upsert_key(
         ApiKey(
@@ -152,22 +153,28 @@ async def test_claim_refresh_concurrent_only_one_wins(
         )
     )
 
-    async def claim() -> bool:
-        return await pg_repository.claim_refresh(key_id, now, max_age)
+    async def acquire(owner: str) -> bool:
+        return await pg_repository.acquire_runtime_lock(
+            key_id,
+            owner,
+            now,
+            ttl_seconds,
+            "test",
+        )
 
-    a, b = await asyncio.gather(claim(), claim())
+    a, b = await asyncio.gather(acquire("owner-a"), acquire("owner-b"))
     assert sorted([a, b]) == [False, True]
 
     await pg_repository.delete_key(key_id)
 
 
 @pytest.mark.asyncio
-async def test_claim_refresh_is_safe_to_call_more_than_once(
+async def test_runtime_lock_is_reentrant_for_same_owner(
     pg_repository: SqlAlchemyKeyRepository,
 ) -> None:
     key_id = f"it-{uuid.uuid4().hex}"
     now = datetime(2025, 7, 15, 10, 0, 0, tzinfo=timezone.utc)
-    max_age = 3600
+    ttl_seconds = 3600
 
     await pg_repository.upsert_key(
         ApiKey(
@@ -179,10 +186,90 @@ async def test_claim_refresh_is_safe_to_call_more_than_once(
         )
     )
 
-    first = await pg_repository.claim_refresh(key_id, now, max_age)
-    second = await pg_repository.claim_refresh(key_id, now, max_age)
+    first = await pg_repository.acquire_runtime_lock(
+        key_id,
+        "owner",
+        now,
+        ttl_seconds,
+        "test",
+    )
+    second = await pg_repository.acquire_runtime_lock(
+        key_id,
+        "owner",
+        now,
+        ttl_seconds,
+        "test",
+    )
 
     assert first is True
-    assert second is False
+    assert second is True
 
     await pg_repository.delete_key(key_id)
+
+
+@pytest.mark.asyncio
+async def test_provider_credential_uniqueness_is_enforced(
+    pg_repository: SqlAlchemyKeyRepository,
+) -> None:
+    await pg_repository.upsert_key(
+        ApiKey(
+            id=f"it-{uuid.uuid4().hex}",
+            provider="openai",
+            credential={"api_key": "sk-test", "region": "us"},
+            status=KeyStatus.AVAILABLE,
+        )
+    )
+
+    with pytest.raises(DuplicateCredentialError):
+        await pg_repository.upsert_key(
+            ApiKey(
+                id=f"it-{uuid.uuid4().hex}",
+                provider="openai",
+                credential={"region": "us", "api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_large_oauth_credential_can_be_saved_and_duplicate_is_blocked(
+    pg_repository: SqlAlchemyKeyRepository,
+) -> None:
+    large_credential = {
+        "access_token": "a" * 3000,
+        "refresh_token": "r" * 3000,
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+        "token_type": "Bearer",
+        "expiry_date": "1776841403442",
+        "type": "gemini_cli_oauth",
+        "last_refresh": "2026-04-22T06:03:24.442158+00:00",
+    }
+
+    await pg_repository.upsert_key(
+        ApiKey(
+            id=f"it-{uuid.uuid4().hex}",
+            provider="gemini_oauth",
+            credential=large_credential,
+            status=KeyStatus.AVAILABLE,
+        )
+    )
+
+    duplicate_credential = {
+        "type": "gemini_cli_oauth",
+        "refresh_token": "r" * 3000,
+        "access_token": "a" * 3000,
+        "scope": "https://www.googleapis.com/auth/cloud-platform",
+        "token_type": "Bearer",
+        "last_refresh": "2026-04-22T06:03:24.442158+00:00",
+        "expiry_date": "1776841403442",
+    }
+
+    with pytest.raises(DuplicateCredentialError):
+        await pg_repository.upsert_key(
+            ApiKey(
+                id=f"it-{uuid.uuid4().hex}",
+                provider="gemini_oauth",
+                credential=duplicate_credential,
+                status=KeyStatus.AVAILABLE,
+            )
+        )
