@@ -1,8 +1,8 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-27
-@Description: OpenAI Codex OAuth 供应商插件
+@Date: 2026-05-12
+@Description: OpenAI Codex OAuth 提供商插件
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ _BASE_MODELS: list[str] = [
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.5",
+    "gpt-image-2",
 ]
 
 

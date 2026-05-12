@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-29
+@Date: 2026-05-12
 @Description: Gemini CLI OAuth 提供商插件
 """
 from __future__ import annotations

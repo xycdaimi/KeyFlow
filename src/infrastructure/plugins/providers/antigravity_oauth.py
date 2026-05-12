@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-29
+@Date: 2026-05-12
 @Description: Gemini Antigravity OAuth 提供商插件
 """
 from __future__ import annotations
@@ -240,6 +240,13 @@ class AntigravityOauthPlugin(ProviderPlugin):
             "gemini-claude-opus-4-6-thinking",
         ]
 
+    @staticmethod
+    def _normalize_model_id(model_id: Any) -> str:
+        normalized = str(model_id or "").strip()
+        if normalized.startswith("claude-"):
+            return f"gemini-{normalized}"
+        return normalized
+
     @classmethod
     def _quota_models_from_payload(cls, payload: dict[str, Any]) -> dict[str, dict[str, Any]] | None:
         raw_models = payload.get("models")
@@ -247,9 +254,13 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return None
 
         models: dict[str, dict[str, Any]] = {}
+        supported_models = set(cls._supported_models())
         for raw_model_id, model_data in raw_models.items():
-            model_id = str(raw_model_id or "").strip()
+            raw_model = str(raw_model_id or "").strip()
+            model_id = cls._normalize_model_id(raw_model)
             if not model_id:
+                continue
+            if model_id not in supported_models and not raw_model.startswith("claude-"):
                 continue
             if not isinstance(model_data, dict):
                 model_data = {}
@@ -277,9 +288,11 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return None
 
         model_ids: list[str] = []
+        supported_models = set(cls._supported_models())
         for raw_model_id in raw_models:
-            model_id = str(raw_model_id or "").strip()
-            if model_id:
+            raw_model = str(raw_model_id or "").strip()
+            model_id = cls._normalize_model_id(raw_model)
+            if model_id and (model_id in supported_models or raw_model.startswith("claude-")):
                 model_ids.append(model_id)
         return sorted(dict.fromkeys(model_ids))
 
