@@ -1,12 +1,12 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-07
+@Date: 2026-05-13
 @Description: FastAPI 应用工厂与生命周期资源管理
 """
 from __future__ import annotations
 
-# import asyncio
+import asyncio
 from contextlib import asynccontextmanager
 import logging
 
@@ -20,6 +20,7 @@ from infrastructure.cache.key_cache import RedisKeyCache
 from infrastructure.config.settings import Settings, get_settings
 from infrastructure.db.bootstrap import bootstrap_write_database
 from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
+from infrastructure.db.sqlite_bootstrap import bootstrap_sqlite_database
 from interfaces.api.routes.admin import router as admin_router
 from interfaces.api.routes.allocate import router as allocate_router
 from interfaces.api.routes.health import router as health_router
@@ -32,7 +33,6 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     try:
         repository: SqlAlchemyKeyRepository = app.state.container.resolve(SqlAlchemyKeyRepository)
-        redis_cache: RedisKeyCache = app.state.container.resolve(RedisKeyCache)
     except punq.MissingDependencyError as exc:
         logger.info(
             "event=lifespan_runtime_dependencies_missing source=api_startup error=%s",
@@ -43,25 +43,34 @@ async def lifespan(app: FastAPI):
 
     write_engine = repository._write_factory.kw["bind"]
     read_engine = repository._read_factory.kw["bind"]
+    redis_cache: RedisKeyCache | None = None
 
-    await bootstrap_write_database(
-        app.state.settings.database_write_url,
-        write_engine,
-    )
+    if getattr(app.state.settings, "runtime_mode", "dev") == "local":
+        await bootstrap_sqlite_database(
+            app.state.settings.local_sqlite_path,
+            write_engine,
+        )
+    else:
+        redis_cache = app.state.container.resolve(RedisKeyCache)
+        await bootstrap_write_database(
+            app.state.settings.database_write_url,
+            write_engine,
+        )
 
     try:
         yield
     finally:
-        await redis_cache._redis.aclose()
+        if redis_cache is not None:
+            await redis_cache._redis.aclose()
         await write_engine.dispose()
-        await read_engine.dispose()
+        if read_engine is not write_engine:
+            await read_engine.dispose()
 
 
 def attach_health_checkers(app: FastAPI, container: punq.Container) -> None:
     """Register async check callables on app.state when DB and Redis are available in the container."""
     try:
         repository: SqlAlchemyKeyRepository = container.resolve(SqlAlchemyKeyRepository)
-        redis_cache: RedisKeyCache = container.resolve(RedisKeyCache)
     except punq.MissingDependencyError:
         return
 
@@ -83,6 +92,15 @@ def attach_health_checkers(app: FastAPI, container: punq.Container) -> None:
         except Exception as exc:
             return False, str(exc)
 
+    settings = container.resolve(Settings)
+    if settings.runtime_mode == "local":
+        app.state.health_checkers = {
+            "app": check_app,
+            "database": check_database,
+        }
+        return
+
+    redis_cache: RedisKeyCache = container.resolve(RedisKeyCache)
     app.state.health_checkers = {
         "app": check_app,
         "database": check_database,

@@ -1,11 +1,12 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-27
+@Date: 2026-05-13
 @Description: SQLAlchemy Key 仓储实现
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,19 @@ from infrastructure.db.models import ApiKeyModel
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def credential_fingerprint(credential: dict) -> str:
+    normalized = json.dumps(credential, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 class SqlAlchemyKeyRepository(KeyRepository):
@@ -56,7 +70,14 @@ class SqlAlchemyKeyRepository(KeyRepository):
     @staticmethod
     def _is_provider_credential_unique_violation(exc: IntegrityError) -> bool:
         message = str(exc.orig).lower()
-        return "uq_api_keys_provider_credential" in message
+        return (
+            "uq_api_keys_provider_credential" in message
+            or (
+                "unique constraint failed" in message
+                and "api_keys.provider" in message
+                and "api_keys.credential_fingerprint" in message
+            )
+        )
 
     async def get_by_provider_credential(
         self, provider: str, credential: dict[str, str]
@@ -78,6 +99,7 @@ class SqlAlchemyKeyRepository(KeyRepository):
 
                 model.provider = key.provider
                 model.credential = key.credential
+                model.credential_fingerprint = credential_fingerprint(key.credential)
                 model.status = key.status.value
                 model.quota_used = key.quota_used
                 model.success_count = key.success_count
@@ -228,6 +250,7 @@ class SqlAlchemyKeyRepository(KeyRepository):
                 )
                 stmt = stmt.values(
                     credential=key.credential,
+                    credential_fingerprint=credential_fingerprint(key.credential),
                     status=key.status.value,
                     cooldown_until=key.cooldown_until,
                     supported_models=key.supported_models,
@@ -277,6 +300,7 @@ class SqlAlchemyKeyRepository(KeyRepository):
                     )
                     .values(
                         credential=key.credential,
+                        credential_fingerprint=credential_fingerprint(key.credential),
                         status=key.status.value,
                         cooldown_until=key.cooldown_until,
                         supported_models=key.supported_models,
@@ -339,13 +363,13 @@ class SqlAlchemyKeyRepository(KeyRepository):
             credential=model.credential,
             status=KeyStatus(model.status),
             quota_used=model.quota_used,
-            last_used_at=model.last_used_at,
+            last_used_at=_as_utc(model.last_used_at),
             success_count=model.success_count,
             error_count=model.error_count,
-            cooldown_until=model.cooldown_until,
+            cooldown_until=_as_utc(model.cooldown_until),
             supported_models=model.supported_models or [],
-            last_refreshed_at=model.last_refreshed_at,
-            updated_at=model.updated_at,
+            last_refreshed_at=_as_utc(model.last_refreshed_at),
+            updated_at=_as_utc(model.updated_at),
             cached_available=model.cached_available,
             cached_quota_available=model.cached_quota_available,
             cached_capacity_score=model.cached_capacity_score,

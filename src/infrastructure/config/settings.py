@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-16
+@Date: 2026-05-13
 @Description: 应用运行时配置
 """
 from functools import lru_cache
@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     api_prefix: str = Field(default="/api", alias="API_PREFIX")
     internal_api_key: str = Field(default="dev-internal-key", alias="INTERNAL_API_KEY")
     model_alias_config_path: str | None = Field(default=None, alias="MODEL_ALIAS_CONFIG_PATH")
+    runtime_mode: str = Field(default="dev", alias="KEYFLOW_RUNTIME_MODE")
+    """Runtime mode: dev uses PostgreSQL + Redis; local uses SQLite WAL."""
+    local_sqlite_path: str = Field(default="/data/keyflow.db", alias="LOCAL_SQLITE_PATH")
+    """SQLite database path used when KEYFLOW_RUNTIME_MODE=local."""
 
     database_read_url: str = Field(
         default="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow",

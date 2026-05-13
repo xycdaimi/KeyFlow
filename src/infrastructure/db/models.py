@@ -1,14 +1,14 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-27
+@Date: 2026-05-13
 @Description: SQLAlchemy 数据库模型
 """
 from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import JSON, DateTime, Float, Index, Integer, String, text
+from sqlalchemy import JSON, DateTime, Float, Index, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -22,7 +22,7 @@ class ApiKeyModel(Base):
         Index(
             "uq_api_keys_provider_credential",
             "provider",
-            text("(md5((credential::jsonb)::text))"),
+            "credential_fingerprint",
             unique=True,
         ),
     )
@@ -31,6 +31,8 @@ class ApiKeyModel(Base):
     provider: Mapped[str] = mapped_column(String(64), index=True)
     credential: Mapped[dict] = mapped_column(JSON)
     """Provider-defined structured credential payload."""
+    credential_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    """SHA-256 fingerprint of normalized credential JSON for portable uniqueness."""
 
     status: Mapped[str] = mapped_column(String(32), default="available")
     quota_used: Mapped[int] = mapped_column(Integer, default=0)
@@ -56,3 +58,13 @@ class ApiKeyModel(Base):
     """Expiration time for runtime snapshot refresh lock."""
     runtime_lock_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
     """Human-readable runtime lock reason for debugging."""
+
+
+class KeyLeaseModel(Base):
+    __tablename__ = "key_leases"
+
+    key_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    lease_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

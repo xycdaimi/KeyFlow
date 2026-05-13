@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-27
+@Date: 2026-05-13
 @Description: 应用依赖注入容器
 """
 from __future__ import annotations
@@ -15,9 +15,11 @@ from domain.services.scorer import KeyScorer, ScoreWeights
 from domain.services.state_machine import KeyStateMachine
 from infrastructure.cache.key_cache import RedisKeyCache
 from infrastructure.cache.redis_client import create_redis_client
+from infrastructure.cache.sqlite_key_cache import SqliteKeyCache
 from infrastructure.config.settings import Settings
 from infrastructure.db.repository_impl import SqlAlchemyKeyRepository
 from infrastructure.db.session import create_session_factory
+from infrastructure.db.sqlite_session import create_sqlite_session_factory
 from infrastructure.logging.logger import configure_logging
 from infrastructure.plugins.base import ProviderRegistry
 from infrastructure.plugins.providers import *
@@ -26,11 +28,20 @@ from infrastructure.plugins.providers import *
 def create_container(settings: Settings) -> punq.Container:
     configure_logging(settings.log_level)
 
-    read_factory, write_factory = create_session_factory(
-        settings.database_read_url,
-        settings.database_write_url,
-    )
-    redis = create_redis_client(settings.redis_url)
+    if settings.runtime_mode == "local":
+        read_factory, write_factory = create_sqlite_session_factory(settings.local_sqlite_path)
+        repository = SqlAlchemyKeyRepository(read_factory, write_factory)
+        allocation_store = SqliteKeyCache(write_factory.kw["bind"])
+    elif settings.runtime_mode == "dev":
+        read_factory, write_factory = create_session_factory(
+            settings.database_read_url,
+            settings.database_write_url,
+        )
+        redis = create_redis_client(settings.redis_url)
+        repository = SqlAlchemyKeyRepository(read_factory, write_factory)
+        allocation_store = RedisKeyCache(redis)
+    else:
+        raise ValueError("KEYFLOW_RUNTIME_MODE must be one of: dev, local")
 
     scorer = KeyScorer(
         ScoreWeights(
@@ -47,8 +58,6 @@ def create_container(settings: Settings) -> punq.Container:
     )
     scheduler = KeyScheduler(scorer, jitter=settings.allocate_jitter)
     state_machine = KeyStateMachine()
-    repository = SqlAlchemyKeyRepository(read_factory, write_factory)
-    allocation_store = RedisKeyCache(redis)
     provider_registry = ProviderRegistry()
     provider_registry.register(OpenAIPlugin())
     provider_registry.register(AnthropicPlugin())
@@ -82,6 +91,9 @@ def create_container(settings: Settings) -> punq.Container:
     container.register(ProviderRegistry, instance=provider_registry)
     container.register(ModelAliasResolver, instance=model_alias_resolver)
     container.register(SqlAlchemyKeyRepository, instance=repository)
-    container.register(RedisKeyCache, instance=allocation_store)
+    if isinstance(allocation_store, RedisKeyCache):
+        container.register(RedisKeyCache, instance=allocation_store)
+    if isinstance(allocation_store, SqliteKeyCache):
+        container.register(SqliteKeyCache, instance=allocation_store)
     container.register(KeyService, instance=service)
     return container

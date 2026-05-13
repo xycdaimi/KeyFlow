@@ -1,0 +1,35 @@
+name: keyflow-local
+
+services:
+  keyflow:
+    container_name: keyflow-local
+    build:
+      context: ../..
+      dockerfile: docker/src/Dockerfile
+    command: ["sh", "scripts/run_local_container.sh"]
+    env_file:
+      - ../../.env
+    environment:
+      KEYFLOW_RUNTIME_MODE: local
+      LOCAL_SQLITE_PATH: ${LOCAL_SQLITE_PATH:-/data/keyflow.db}
+      PORT: ${PORT:-8000}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-2}
+    volumes:
+      - ../../${MODEL_ALIAS_CONFIG_PATH:-config/model_aliases.yaml}:/app/${MODEL_ALIAS_CONFIG_PATH:-config/model_aliases.yaml}:ro
+      - keyflow-local-data:/data
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; p=os.environ.get('PORT','8000'); urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  keyflow-local-data:
