@@ -269,67 +269,118 @@ async def test_gemini_web_proxy_uses_both_cookie_fields(monkeypatch: pytest.Monk
 async def test_gemini_select_probe_model_skips_non_generate_models_across_pages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class _FakeResponse:
-        def __init__(self, payload: dict, status_code: int = 200):
-            self._payload = payload
-            self.status_code = status_code
-            self.is_success = 200 <= status_code < 300
+    class _FakeModels:
+        def __init__(self) -> None:
+            self.generated_models: list[str] = []
 
-        def json(self) -> dict:
-            return self._payload
+        async def list(self, *args, **kwargs):
+            async def _items():
+                yield {
+                    "name": "models/imagen-3.0-generate",
+                    "supportedGenerationMethods": ["predict"],
+                }
+                yield {
+                    "name": "models/gemini-2.0-flash",
+                    "supportedGenerationMethods": ["generateContent"],
+                }
+
+            return _items()
+
+        async def generate_content(self, *args, **kwargs) -> dict:
+            self.generated_models.append(kwargs["model"])
+            return {"candidates": []}
+
+    class _FakeAioClient:
+        def __init__(self, models: _FakeModels) -> None:
+            self.models = models
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
 
     class _FakeClient:
-        def __init__(self) -> None:
-            self.get_calls = 0
-            self.post_urls: list[str] = []
+        def __init__(self, **kwargs) -> None:
+            self.aio = _FakeAioClient(fake_models)
 
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb) -> None:
-            return None
-
-        async def get(self, *args, **kwargs) -> _FakeResponse:
-            self.get_calls += 1
-            if self.get_calls == 1:
-                return _FakeResponse(
-                    {
-                        "models": [
-                            {
-                                "name": "models/imagen-3.0-generate",
-                                "supportedGenerationMethods": ["predict"],
-                            }
-                        ],
-                        "nextPageToken": "page-2",
-                    }
-                )
-            return _FakeResponse(
-                {
-                    "models": [
-                        {
-                            "name": "models/gemini-2.0-flash",
-                            "supportedGenerationMethods": ["generateContent"],
-                        }
-                    ]
-                }
-            )
-
-        async def post(self, *args, **kwargs) -> _FakeResponse:
-            self.post_urls.append(args[0])
-            return _FakeResponse({"candidates": []})
-
-    fake_client = _FakeClient()
-    monkeypatch.setattr(
-        "infrastructure.plugins.providers.gemini.httpx.AsyncClient",
-        lambda timeout=10: fake_client,
-    )
-
+    fake_models = _FakeModels()
+    monkeypatch.setattr("infrastructure.plugins.providers.gemini.genai.Client", _FakeClient)
     plugin = GeminiPlugin()
 
     assert await plugin.is_credential_available({"api_key": "AIza-test"}) is True
-    assert fake_client.post_urls == [
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-    ]
+    assert fake_models.generated_models == ["gemini-2.0-flash"]
+
+
+@pytest.mark.anyio
+async def test_gemini_vertex_ai_fetch_models_uses_genai_client_with_vertex_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeClient:
+        def __init__(self, **kwargs) -> None:
+            raise AssertionError("Vertex AI fetch_models must not call genai.Client")
+
+    monkeypatch.setattr("infrastructure.plugins.providers.gemini.genai.Client", _FakeClient)
+
+    plugin = GeminiPlugin()
+    models = await plugin.fetch_models(
+        {
+            "api_key": "AQ.A-test",
+            "vertexai": "true",
+        }
+    )
+
+    assert "gemini-2.5-flash" in models
+    assert "gemini-2.5-pro" in models
+    assert "gemini-3.1-flash-image" in models
+    assert "gemini-claude-sonnet-4-6" in models
+
+
+@pytest.mark.anyio
+async def test_gemini_vertex_ai_availability_generates_with_sdk_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeModels:
+        def __init__(self) -> None:
+            self.generated_models: list[str] = []
+
+        async def list(self, *args, **kwargs):
+            raise AssertionError("Vertex AI availability must not call models.list")
+
+        async def generate_content(self, *args, **kwargs) -> dict:
+            self.generated_models.append(kwargs["model"])
+            captured["contents"] = kwargs["contents"]
+            captured["config"] = kwargs["config"]
+            return {"candidates": []}
+
+    class _FakeAioClient:
+        def __init__(self, models: _FakeModels) -> None:
+            self.models = models
+
+        async def aclose(self) -> None:
+            return None
+
+    class _FakeClient:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.aio = _FakeAioClient(fake_models)
+
+    fake_models = _FakeModels()
+    monkeypatch.setattr("infrastructure.plugins.providers.gemini.genai.Client", _FakeClient)
+    plugin = GeminiPlugin()
+    available = await plugin.is_credential_available(
+        {
+            "api_key": "AQ.A-test",
+            "vertexai": "true",
+        }
+    )
+
+    assert available is True
+    assert captured["vertexai"] is True
+    assert "project" not in captured
+    assert "location" not in captured
+    assert fake_models.generated_models == ["gemini-2.5-flash"]
+    assert captured["contents"] == "ping"
 
 
 @pytest.mark.anyio

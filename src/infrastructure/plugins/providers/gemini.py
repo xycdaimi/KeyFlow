@@ -1,16 +1,32 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-16
+@Date: 2026-05-18
 @Description: Google Gemini official API provider plugin
 """
 from __future__ import annotations
 
 import httpx
+from google import genai
+from google.genai import types
 
 from infrastructure.plugins.base import EgressMode, ProviderPlugin
 
 _BASE_URL = "https://generativelanguage.googleapis.com"
+_VERTEXAI_TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+_VERTEXAI_MODELS: tuple[str, ...] = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemini-2.5-pro-preview-06-05",
+    "gemini-2.5-flash-preview-09-2025",
+    "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-image",
+)
+_VERTEXAI_PROBE_MODEL = "gemini-2.5-flash"
 
 
 class GeminiPlugin(ProviderPlugin):
@@ -23,7 +39,7 @@ class GeminiPlugin(ProviderPlugin):
 
     @property
     def description(self) -> str:
-        return "Google Gemini official API at generativelanguage.googleapis.com."
+        return "Google Gemini official API for AI Studio and Vertex AI API keys."
 
     @property
     def auth_type(self) -> str:
@@ -31,123 +47,165 @@ class GeminiPlugin(ProviderPlugin):
 
     @property
     def credential_hint(self) -> str:
-        return '{"api_key": "AIza..."} (Google AI Studio API Key)'
+        return (
+            '{"api_key": "AIza..."} (Google AI Studio API Key) or '
+            '{"api_key": "AQ.A...", "vertexai": "true"} '
+            "(Vertex AI API Key)"
+        )
 
     @property
     def egress_mode(self) -> EgressMode:
         return "proxy"
 
+    def is_plugin_ready(self) -> bool:
+        return True
+
     @staticmethod
     def _api_key(credential: dict[str, str]) -> str:
         return credential["api_key"]
 
+    @staticmethod
+    def _is_vertexai(credential: dict[str, str]) -> bool:
+        return str(credential.get("vertexai", "")).strip().lower() in _VERTEXAI_TRUE_VALUES
+
+    @staticmethod
+    def _normalize_sdk_model_name(model: str) -> str:
+        marker = "/publishers/google/models/"
+        if marker in model:
+            return model.rsplit(marker, 1)[1]
+        for prefix in ("publishers/google/models/", "models/"):
+            if model.startswith(prefix):
+                return model.removeprefix(prefix)
+        return model
+
     async def verify_upstream_root_reachable(self) -> None:
         await self._ensure_upstream_root_http_reachable(_BASE_URL, httpx.AsyncClient)
 
+    def _build_genai_client(self, credential: dict[str, str]):
+        api_key = self._api_key(credential)
+        vertexai = self._is_vertexai(credential)
+        endpoint = str(credential.get("endpoint", "")).strip()
+
+        client_kwargs = {"api_key": api_key}
+        http_options = self._build_genai_http_options(endpoint)
+        if http_options is not None:
+            client_kwargs["http_options"] = http_options
+        if vertexai:
+            client_kwargs["vertexai"] = vertexai
+
+        return genai.Client(**client_kwargs)
+
+    def _build_genai_http_options(self, endpoint: str):
+        proxy = self._proxy_url()
+        http_options_kwargs = {"apiVersion": "v1"}
+        if endpoint:
+            http_options_kwargs["baseUrl"] = endpoint
+        if not proxy:
+            return types.HttpOptions(**http_options_kwargs)
+        http_options_kwargs["clientArgs"] = {"proxy": proxy}
+        http_options_kwargs["asyncClientArgs"] = {"proxy": proxy}
+        return types.HttpOptions(**http_options_kwargs)
+
     @staticmethod
-    def _availability_status(response: httpx.Response) -> str:
-        if response.is_success:
-            return "AVAILABLE"
+    def _model_field(model, *names: str):
+        for name in names:
+            if isinstance(model, dict) and name in model:
+                return model[name]
+            value = getattr(model, name, None)
+            if value is not None:
+                return value
+        return None
 
-        code = response.status_code
-        if code == 403:
-            return "UNAVAILABLE_PERMISSION"
-        if code == 400:
-            return "UNAVAILABLE_CONFIG"
-        if code == 429:
-            return "TEMP_UNAVAILABLE"
-        if code == 500:
-            return "TEMP_UNAVAILABLE"
-        return "UNKNOWN"
+    @classmethod
+    def _model_id_from_sdk_model(cls, model) -> str:
+        raw_name = str(
+            cls._model_field(model, "name", "model_id", "modelId", "publisher_model_id", "publisherModelId")
+            or ""
+        )
+        return cls._normalize_sdk_model_name(raw_name)
 
-    @staticmethod
-    def _normalize_model_name(model: str) -> str:
-        return model if model.startswith("models/") else f"models/{model}"
+    @classmethod
+    def _sdk_model_supports_generate_content(cls, model) -> bool:
+        methods = cls._model_field(model, "supported_generation_methods", "supportedGenerationMethods")
+        if methods:
+            return "generateContent" in methods or "generate_content" in methods
 
-    async def _select_probe_model(self, client: httpx.AsyncClient, api_key: str) -> str | None:
-        page_token: str | None = None
+        supported_actions = cls._model_field(model, "supported_actions", "supportedActions") or {}
+        if not supported_actions:
+            return True
 
-        while True:
-            params: dict[str, str | int] = {"pageSize": 100}
-            if page_token:
-                params["pageToken"] = page_token
+        open_api = cls._model_field(supported_actions, "open_api_spec", "openApiSpec") or {}
+        endpoints = str(cls._model_field(open_api, "endpoints") or "")
+        if "generateContent" in endpoints:
+            return True
 
-            response = await client.get(
-                f"{_BASE_URL}/v1beta/models",
-                headers={"x-goog-api-key": api_key},
-                params=params,
-            )
-            if not response.is_success:
-                return None
-
-            body = response.json()
-            for item in body.get("models", []):
-                raw_name = str(item.get("name") or "")
-                model_id = raw_name.removeprefix("models/")
-                if not model_id:
-                    continue
-                methods = item.get("supportedGenerationMethods") or []
-                if "generateContent" in methods:
-                    return model_id
-
-            page_token = body.get("nextPageToken")
-            if not page_token:
-                return None
+        method_names = str(cls._model_field(supported_actions, "method_names", "methodNames") or "")
+        return "generateContent" in method_names
 
     async def fetch_models(self, credential: dict[str, str]) -> list[str]:
-        api_key = self._api_key(credential)
+        if self._is_vertexai(credential):
+            return list(_VERTEXAI_MODELS)
+
         model_ids: list[str] = []
-        page_token: str | None = None
-
-        async with self._build_http_client(httpx.AsyncClient) as client:
-            while True:
-                params: dict[str, str | int] = {"pageSize": 100}
-                if page_token:
-                    params["pageToken"] = page_token
-
-                response = await client.get(
-                    f"{_BASE_URL}/v1beta/models",
-                    headers={"x-goog-api-key": api_key},
-                    params=params,
-                )
-                response.raise_for_status()
-                body = response.json()
-
-                for item in body.get("models", []):
-                    raw_name: str = item.get("name", "")
-                    model_id = raw_name.removeprefix("models/")
-                    if model_id:
-                        model_ids.append(model_id)
-
-                page_token = body.get("nextPageToken")
-                if not page_token:
-                    break
-
+        client = self._build_genai_client(credential)
+        aio_client = client.aio
+        try:
+            pager = await aio_client.models.list(config={"page_size": 100})
+            async for item in pager:
+                model_id = self._model_id_from_sdk_model(item)
+                if model_id:
+                    model_ids.append(model_id)
+        finally:
+            await aio_client.aclose()
         return model_ids
 
     async def is_credential_available(self, credential: dict[str, str]) -> bool:
-        api_key = self._api_key(credential)
-        async with self._build_http_client(httpx.AsyncClient) as client:
-            probe_model = await self._select_probe_model(client, api_key)
+        client = self._build_genai_client(credential)
+        aio_client = client.aio
+        try:
+            probe_model = (
+                _VERTEXAI_PROBE_MODEL
+                if self._is_vertexai(credential)
+                else await self._select_probe_model(aio_client)
+            )
             if not probe_model:
                 return False
 
-            response = await client.post(
-                f"{_BASE_URL}/v1beta/{self._normalize_model_name(probe_model)}:generateContent",
-                headers={"x-goog-api-key": api_key},
-                json={
-                    "contents": [{"parts": [{"text": "ping"}]}],
-                    "generationConfig": {"maxOutputTokens": 1},
-                },
+            await aio_client.models.generate_content(
+                model=probe_model,
+                contents="ping",
+                config=types.GenerateContentConfig(maxOutputTokens=1),
             )
-            return self._availability_status(response) == "AVAILABLE"
+            return True
+        except Exception:
+            return False
+        finally:
+            await aio_client.aclose()
+
+    async def _select_probe_model(self, aio_client) -> str | None:
+        pager = await aio_client.models.list(config={"page_size": 100})
+        async for item in pager:
+            model_id = self._model_id_from_sdk_model(item)
+            if model_id.startswith("gemini-") and self._sdk_model_supports_generate_content(item):
+                return model_id
+        return None
 
     async def explain_credential(self, credential: dict[str, str]) -> dict:
         api_key = self._api_key(credential)
-        return {
+        info = {
             "provider": self.name,
             "status": "unknown",
             "model_source": self.model_source,
-            "auth_type": "x-goog-api-key",
             "credential_hint": api_key[:8] + "***",
         }
+        if self._is_vertexai(credential):
+            info.update(
+                {
+                    "auth_type": "vertex_api_key",
+                    "vertexai": True,
+                }
+            )
+            return info
+
+        info["auth_type"] = "x-goog-api-key"
+        return info
