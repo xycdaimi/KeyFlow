@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-12
+@Date: 2026-05-19
 @Description: OpenAI Codex OAuth 提供商插件
 """
 from __future__ import annotations
@@ -118,13 +118,13 @@ class CodexOauthPlugin(ProviderPlugin):
         return token[:8] + "***"
 
     @staticmethod
-    def _is_near_expiry(credential: dict[str, str], near_minutes: int = 20) -> bool:
+    def _is_near_expiry(credential: dict[str, Any], near_minutes: int = 20) -> bool:
         expired_at = CodexOauthPlugin._parse_expired_at(credential.get("expired"))
         if expired_at is None:
             return False
         return expired_at <= (_utc_now() + timedelta(minutes=near_minutes))
 
-    def _normalize_credential(self, credential: dict[str, str]) -> dict[str, str]:
+    def _normalize_credential(self, credential: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(credential)
         access_token = str(normalized.get("access_token") or "")
         refresh_token = str(normalized.get("refresh_token") or "")
@@ -153,7 +153,7 @@ class CodexOauthPlugin(ProviderPlugin):
         normalized["type"] = "codex"
         return normalized
 
-    async def _refresh_credential(self, credential: dict[str, str]) -> dict[str, str]:
+    async def _refresh_credential(self, credential: dict[str, Any]) -> dict[str, Any]:
         refresh_token = credential.get("refresh_token")
         if not refresh_token:
             raise ValueError("credential.refresh_token is required for token refresh")
@@ -195,7 +195,7 @@ class CodexOauthPlugin(ProviderPlugin):
         refreshed = self._normalize_credential(refreshed_input)
         return refreshed
 
-    def _is_oauth_credential_fresh(self, credential: dict[str, str]) -> bool:
+    def _is_oauth_credential_fresh(self, credential: dict[str, Any]) -> bool:
         normalized = self._normalize_credential(credential)
         if normalized.get("refresh_token"):
             if not normalized.get("access_token"):
@@ -203,14 +203,14 @@ class CodexOauthPlugin(ProviderPlugin):
             return not self._is_near_expiry(normalized)
         return bool(normalized.get("access_token"))
 
-    async def _refresh_oauth_credential(self, credential: dict[str, str]) -> dict[str, str] | None:
+    async def _refresh_oauth_credential(self, credential: dict[str, Any]) -> dict[str, Any] | None:
         try:
             normalized = self._normalize_credential(credential)
             return await self._refresh_credential(normalized)
         except Exception:
             return None
 
-    async def prepare_credential(self, credential: dict[str, str]) -> CredentialPreparationResult:
+    async def prepare_credential(self, credential: dict[str, Any]) -> CredentialPreparationResult:
         normalized = self._normalize_credential(credential)
         return CredentialPreparationResult(
             credential=normalized,
@@ -218,7 +218,7 @@ class CodexOauthPlugin(ProviderPlugin):
         )
 
     @staticmethod
-    def _usage_headers(runtime_credential: dict[str, str]) -> dict[str, str]:
+    def _usage_headers(runtime_credential: dict[str, Any]) -> dict[str, Any]:
         return {
             "user-agent": (
                 f"codex-tui/{_CODEX_VERSION} "
@@ -226,13 +226,13 @@ class CodexOauthPlugin(ProviderPlugin):
                 f"(codex-tui; {_CODEX_VERSION})"
             ),
             "authorization": f"Bearer {runtime_credential['access_token']}",
-            "chatgpt-account-id": runtime_credential["account_id"],
+            "chatgpt-account-id": str(runtime_credential["account_id"]),
             "accept": "*/*",
             "host": "chatgpt.com",
             "Connection": "close",
         }
 
-    async def _retrieve_usage(self, runtime_credential: dict[str, str]) -> httpx.Response | None:
+    async def _retrieve_usage(self, runtime_credential: dict[str, Any]) -> httpx.Response | None:
         try:
             async with self._build_http_client(httpx.AsyncClient) as client:
                 return await client.get(
@@ -285,17 +285,17 @@ class CodexOauthPlugin(ProviderPlugin):
             reason=f"plan_type={payload.get('plan_type', 'unknown')}",
         )
 
-    async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+    async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
         fast_models = [f"{m}-fast" for m in _BASE_MODELS]
         return list(dict.fromkeys([*_BASE_MODELS, *fast_models]))
 
-    async def is_credential_available(self, credential: dict[str, str]) -> bool:
+    async def is_credential_available(self, credential: dict[str, Any]) -> bool:
         response = await self._retrieve_usage(credential)
         if response is None or not response.is_success:
             return False
         return True
 
-    async def get_capacity_signal(self, credential: dict[str, str]) -> CapacitySignal | None:
+    async def get_capacity_signal(self, credential: dict[str, Any]) -> CapacitySignal | None:
         response = await self._retrieve_usage(credential)
         if response is None:
             return None
@@ -310,7 +310,7 @@ class CodexOauthPlugin(ProviderPlugin):
             return None
         return self._capacity_signal_from_usage_payload(payload)
 
-    async def explain_credential(self, credential: dict[str, str]) -> dict:
+    async def explain_credential(self, credential: dict[str, Any]) -> dict:
         try:
             normalized = self._normalize_credential(credential)
             status = "ok"

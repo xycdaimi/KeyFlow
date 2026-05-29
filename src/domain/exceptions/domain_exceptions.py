@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-27
+@Date: 2026-05-21
 @Description: KeyFlow 领域层异常类型定义
 """
 
@@ -12,6 +12,10 @@ class DomainError(Exception):
 
 class NoAvailableKeyError(DomainError):
     """Raised when no key can be allocated."""
+
+
+class AllocationStoreUnavailableError(DomainError):
+    """Raised when key allocation cannot reach any atomic coordination store."""
 
 
 class KeyNotFoundError(DomainError):

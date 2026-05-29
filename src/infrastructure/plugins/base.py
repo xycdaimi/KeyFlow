@@ -1,14 +1,14 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-23
+@Date: 2026-05-19
 @Description: 供应商插件抽象基类与注册表
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
@@ -17,7 +17,7 @@ from infrastructure.config.settings import get_settings
 
 PLUGIN_INTERFACE_VERSION = "1.0.0"
 ModelSource = Literal["remote", "static"]
-CredentialDict = dict[str, str]
+CredentialDict = dict[str, Any]
 EgressMode = Literal["direct", "proxy"]
 
 _UPSTREAM_ROOT_TIMEOUT_SECONDS = 5.0

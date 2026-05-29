@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-08
+@Date: 2026-05-21
 @Description: API 路由与应用启动契约测试
 """
 import asyncio
@@ -20,7 +20,7 @@ from sqlalchemy.engine import make_url
 from application.services.key_service import AllocationResult, KeyService
 from application.services.model_alias_resolver import ModelAliasResolver
 from domain.entities.api_key import ApiKey
-from domain.exceptions.domain_exceptions import NoAvailableKeyError
+from domain.exceptions.domain_exceptions import AllocationStoreUnavailableError, NoAvailableKeyError
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer
 from domain.services.state_machine import KeyStateMachine
@@ -334,7 +334,7 @@ def test_allocate_and_report_cycle() -> None:
     assert success_response.json()["quota_used"] == 12
 
     allocation_store: InMemoryAllocationStore = client.app.state.test_allocation_store
-    assert ("openai", "key-1") in allocation_store.released
+    assert ("openai", "default", "key-1") in allocation_store.released
 
 
 def test_allocate_recovers_expired_cooldown_inline() -> None:
@@ -379,7 +379,7 @@ def test_report_error_accepts_generic_error_type() -> None:
     payload = response.json()
     assert payload["status"] == "available"
     allocation_store: InMemoryAllocationStore = client.app.state.test_allocation_store
-    assert ("openai", "key-1") in allocation_store.released
+    assert ("openai", "default", "key-1") in allocation_store.released
 
 
 def test_plugin_unavailable_blocks_allocation() -> None:
@@ -811,7 +811,7 @@ def test_allocate_by_model_returns_404_when_no_key_available(monkeypatch: pytest
     client = build_client()
     service: KeyService = client.app.state.container.resolve(KeyService)
 
-    async def _fake_allocate_key_by_model(model: str) -> AllocationResult:
+    async def _fake_allocate_key_by_model(model: str, pool=None) -> AllocationResult:
         raise NoAvailableKeyError(f"no available key for {model}")
 
     monkeypatch.setattr(service, "allocate_key_by_model", _fake_allocate_key_by_model, raising=False)
@@ -824,6 +824,27 @@ def test_allocate_by_model_returns_404_when_no_key_available(monkeypatch: pytest
 
     assert response.status_code == 404
     assert response.json() == {"detail": "no_available_key"}
+
+
+def test_allocate_by_model_returns_503_when_allocation_store_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = build_client()
+    service: KeyService = client.app.state.container.resolve(KeyService)
+
+    async def _fake_allocate_key_by_model(model: str, pool=None) -> AllocationResult:
+        raise AllocationStoreUnavailableError("allocation store unavailable")
+
+    monkeypatch.setattr(service, "allocate_key_by_model", _fake_allocate_key_by_model, raising=False)
+
+    response = client.post(
+        "/api/internal/allocate-by-model",
+        json={"model": "gpt-4o"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "allocation_store_unavailable"}
 
 
 def test_allocate_by_model_returns_404_when_model_not_supported_anywhere() -> None:
@@ -1064,6 +1085,7 @@ async def test_lifespan_bootstraps_only_write_database(
             raise AssertionError(f"unexpected dependency lookup: {dependency}")
 
     settings = Settings(
+        KEYFLOW_RUNTIME_MODE="dev",
         DATABASE_URL_READ="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow_read",
         DATABASE_URL_WRITE="postgresql+asyncpg://keyflow:keyflow@localhost:5432/keyflow_write",
     )
@@ -1264,6 +1286,8 @@ def test_admin_key_crud_and_model_sync() -> None:
     assert created == {
         "key_id": key_id,
         "credential": {"api_key": "sk-new"},
+        "pool": "default",
+        "max_concurrent_uses": 1,
         "status": "available",
     }
 
@@ -1279,6 +1303,8 @@ def test_admin_key_crud_and_model_sync() -> None:
     assert get_key_response.status_code == 200
     assert get_key_response.json() == {
         "credential": {"api_key": "sk-updated"},
+        "pool": "default",
+        "max_concurrent_uses": 1,
         "status": "available",
     }
 

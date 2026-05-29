@@ -1325,6 +1325,25 @@ async def test_gemini_oauth_prepare_and_explain_preserve_email() -> None:
 
 
 @pytest.mark.anyio
+async def test_gemini_oauth_prepare_credential_preserves_extra_json_value_types() -> None:
+    plugin = GeminiOauthPlugin()
+
+    result = await plugin.prepare_credential(
+        {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "vertexai": True,
+            "quota": 10,
+            "metadata": {"region": "us-central1"},
+        }
+    )
+
+    assert result.credential["vertexai"] is True
+    assert result.credential["quota"] == 10
+    assert result.credential["metadata"] == {"region": "us-central1"}
+
+
+@pytest.mark.anyio
 async def test_antigravity_oauth_prepare_and_explain_preserve_email() -> None:
     plugin = AntigravityOauthPlugin()
 
@@ -1339,6 +1358,25 @@ async def test_antigravity_oauth_prepare_and_explain_preserve_email() -> None:
     assert result.credential["email"] == "user@example.com"
     info = await plugin.explain_credential(result.credential)
     assert info["email"] == "user@example.com"
+
+
+@pytest.mark.anyio
+async def test_antigravity_oauth_prepare_credential_preserves_extra_json_value_types() -> None:
+    plugin = AntigravityOauthPlugin()
+
+    result = await plugin.prepare_credential(
+        {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "vertexai": True,
+            "quota": 10,
+            "metadata": {"region": "us-central1"},
+        }
+    )
+
+    assert result.credential["vertexai"] is True
+    assert result.credential["quota"] == 10
+    assert result.credential["metadata"] == {"region": "us-central1"}
 
 
 @pytest.mark.anyio

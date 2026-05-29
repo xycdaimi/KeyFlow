@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-13
+@Date: 2026-05-29
 @Description: SQLAlchemy 数据库模型
 """
 from __future__ import annotations
@@ -29,6 +29,8 @@ class ApiKeyModel(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(64), index=True)
+    pool: Mapped[str] = mapped_column(String(32), default="default", index=True)
+    max_concurrent_uses: Mapped[int] = mapped_column(Integer, default=1)
     credential: Mapped[dict] = mapped_column(JSON)
     """Provider-defined structured credential payload."""
     credential_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -65,6 +67,8 @@ class KeyLeaseModel(Base):
 
     key_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     provider: Mapped[str] = mapped_column(String(64), index=True)
+    pool: Mapped[str] = mapped_column(String(32), default="default", index=True)
     lease_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    active_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

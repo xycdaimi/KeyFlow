@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
 from application.services.key_service import KeyService
-from domain.exceptions.domain_exceptions import NoAvailableKeyError
+from domain.exceptions.domain_exceptions import AllocationStoreUnavailableError, NoAvailableKeyError
 from infrastructure.config.settings import Settings
 from interfaces.api.deps import get_key_service, get_settings
 from interfaces.middleware.auth import verify_internal_key
@@ -22,11 +22,16 @@ async def allocate_key(
 ) -> AllocateResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
-        allocation = await service.allocate_key(payload.provider, payload.model)
+        allocation = await service.allocate_key(payload.provider, payload.model, pool=payload.pool)
     except NoAvailableKeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no_available_key",
+        ) from exc
+    except AllocationStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="allocation_store_unavailable",
         ) from exc
 
     return AllocateResponse(
@@ -45,11 +50,16 @@ async def allocate_key_by_model(
 ) -> AllocateByModelResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
-        allocation = await service.allocate_key_by_model(payload.model)
+        allocation = await service.allocate_key_by_model(payload.model, pool=payload.pool)
     except NoAvailableKeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="no_available_key",
+        ) from exc
+    except AllocationStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="allocation_store_unavailable",
         ) from exc
 
     return AllocateByModelResponse(

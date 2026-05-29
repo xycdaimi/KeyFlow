@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-12
+@Date: 2026-05-19
 @Description: Gemini Antigravity OAuth 提供商插件
 """
 from __future__ import annotations
@@ -120,13 +120,19 @@ class AntigravityOauthPlugin(ProviderPlugin):
         return expiry <= (_utc_now() + timedelta(minutes=near_minutes))
 
     @staticmethod
-    def _stringify_credential(credential: dict[str, Any]) -> dict[str, str]:
-        return {key: str(value) for key, value in credential.items() if value is not None}
+    def _drop_none_credential_values(credential: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in credential.items() if value is not None}
 
-    def _normalize_credential(self, credential: dict[str, Any]) -> dict[str, str]:
-        normalized = self._stringify_credential(credential)
-        if not normalized.get("refresh_token") and not normalized.get("access_token"):
+    def _normalize_credential(self, credential: dict[str, Any]) -> dict[str, Any]:
+        normalized = self._drop_none_credential_values(credential)
+        refresh_token = str(normalized.get("refresh_token") or "")
+        access_token = str(normalized.get("access_token") or "")
+        if not refresh_token and not access_token:
             raise ValueError("credential.refresh_token or credential.access_token is required")
+        if refresh_token:
+            normalized["refresh_token"] = refresh_token
+        if access_token:
+            normalized["access_token"] = access_token
         email = str(normalized.get("email") or "").strip()
         if email:
             normalized["email"] = email
@@ -140,10 +146,10 @@ class AntigravityOauthPlugin(ProviderPlugin):
         return normalized
 
     @staticmethod
-    def _persist_credential(runtime_credential: dict[str, str]) -> dict[str, str]:
+    def _persist_credential(runtime_credential: dict[str, Any]) -> dict[str, Any]:
         return dict(runtime_credential)
 
-    async def _refresh_credential(self, credential: dict[str, Any]) -> dict[str, str]:
+    async def _refresh_credential(self, credential: dict[str, Any]) -> dict[str, Any]:
         refresh_token = str(credential.get("refresh_token") or "")
         if not refresh_token:
             raise ValueError("credential.refresh_token is required for token refresh")
@@ -182,7 +188,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
         return self._normalize_credential(refreshed)
 
     @staticmethod
-    def _runtime_headers(runtime_credential: dict[str, str]) -> dict[str, str]:
+    def _runtime_headers(runtime_credential: dict[str, Any]) -> dict[str, Any]:
         return {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {runtime_credential['access_token']}",
@@ -191,7 +197,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
 
     async def _antigravity_post(
         self,
-        runtime_credential: dict[str, str],
+        runtime_credential: dict[str, Any],
         method: str,
         body: dict[str, Any],
     ) -> httpx.Response | None:
@@ -211,14 +217,14 @@ class AntigravityOauthPlugin(ProviderPlugin):
                 last_response = response
         return last_response
 
-    async def _fetch_available_models(self, runtime_credential: dict[str, str]) -> httpx.Response | None:
+    async def _fetch_available_models(self, runtime_credential: dict[str, Any]) -> httpx.Response | None:
         return await self._antigravity_post(
             runtime_credential,
             "fetchAvailableModels",
             {},
         )
 
-    async def _fetch_models_with_quotas(self, runtime_credential: dict[str, str]) -> httpx.Response | None:
+    async def _fetch_models_with_quotas(self, runtime_credential: dict[str, Any]) -> httpx.Response | None:
         return await self._antigravity_post(
             runtime_credential,
             "fetchAvailableModels",
@@ -319,7 +325,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return str(project.get("id") or project.get("name") or "")
         return ""
 
-    async def _discover_project_id(self, runtime_credential: dict[str, str]) -> str:
+    async def _discover_project_id(self, runtime_credential: dict[str, Any]) -> str:
         initial_project_id = ""
         metadata = {
             "ideType": "IDE_UNSPECIFIED",
@@ -389,13 +395,13 @@ class AntigravityOauthPlugin(ProviderPlugin):
 
         return _generate_project_id()
 
-    def _normalize_access_credential(self, credential: dict[str, Any]) -> dict[str, str]:
+    def _normalize_access_credential(self, credential: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(self._normalize_credential(credential))
         if not normalized.get("access_token"):
             raise ValueError("credential.access_token is required")
         return normalized
 
-    def _normalize_project_runtime_credential(self, credential: dict[str, Any]) -> dict[str, str] | None:
+    def _normalize_project_runtime_credential(self, credential: dict[str, Any]) -> dict[str, Any] | None:
         normalized = self._normalize_access_credential(credential)
         if not str(normalized.get("project_id") or "").strip():
             return None
@@ -409,7 +415,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return False
         return not self._is_near_expiry(normalized)
 
-    async def _refresh_oauth_credential(self, credential: dict[str, Any]) -> dict[str, str] | None:
+    async def _refresh_oauth_credential(self, credential: dict[str, Any]) -> dict[str, Any] | None:
         try:
             normalized = self._normalize_credential(credential)
             refreshed = await self._refresh_credential(normalized)
@@ -417,7 +423,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return None
         return self._persist_credential(refreshed)
 
-    async def _build_runtime_credential(self, credential: dict[str, Any]) -> dict[str, str]:
+    async def _build_runtime_credential(self, credential: dict[str, Any]) -> dict[str, Any]:
         project_id = str(credential.get("project_id") or "").strip()
         normalized = dict(self._normalize_credential(credential))
         runtime_credential = dict(normalized)
@@ -428,14 +434,14 @@ class AntigravityOauthPlugin(ProviderPlugin):
     def _fallback_models() -> list[str]:
         return AntigravityOauthPlugin._supported_models()
 
-    async def prepare_credential(self, credential: dict[str, str]) -> CredentialPreparationResult:
+    async def prepare_credential(self, credential: dict[str, Any]) -> CredentialPreparationResult:
         persisted_credential = self._persist_credential(self._normalize_credential(credential))
         return CredentialPreparationResult(
             credential=persisted_credential,
             changed=persisted_credential != credential,
         )
 
-    async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+    async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
         try:
             runtime_credential = self._normalize_access_credential(credential)
         except Exception:
@@ -456,7 +462,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return self._fallback_models()
         return models
 
-    async def is_credential_available(self, credential: dict[str, str]) -> bool:
+    async def is_credential_available(self, credential: dict[str, Any]) -> bool:
         try:
             runtime_credential = self._normalize_access_credential(credential)
         except Exception:
@@ -470,7 +476,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return False
         return isinstance(payload, dict) and self._model_ids_from_payload(payload) is not None
 
-    async def get_capacity_signal(self, credential: dict[str, str]) -> CapacitySignal | None:
+    async def get_capacity_signal(self, credential: dict[str, Any]) -> CapacitySignal | None:
         try:
             runtime_credential = self._normalize_project_runtime_credential(credential)
         except Exception:
@@ -489,7 +495,7 @@ class AntigravityOauthPlugin(ProviderPlugin):
             return None
         return self._capacity_signal_from_payload(payload)
 
-    async def explain_credential(self, credential: dict[str, str]) -> dict:
+    async def explain_credential(self, credential: dict[str, Any]) -> dict:
         try:
             normalized = self._normalize_credential(credential)
             status = "ok"

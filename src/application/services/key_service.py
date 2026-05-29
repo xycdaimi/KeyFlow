@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-27
+@Date: 2026-05-29
 @Description: Key 生命周期与分配应用服务
 """
 from __future__ import annotations
@@ -11,10 +11,12 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from uuid import uuid4
 
 from domain.entities.api_key import ApiKey
 from domain.exceptions.domain_exceptions import (
+    AllocationStoreUnavailableError,
     DuplicateCredentialError,
     InvalidCredentialError,
     KeyNotFoundError,
@@ -27,6 +29,7 @@ from domain.repositories.key_repository import KeyAllocationStore, KeyRepository
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer
 from domain.services.state_machine import KeyStateMachine
+from domain.value_objects.key_pool import KeyPool
 from domain.value_objects.key_status import KeyStatus
 from application.services.model_alias_resolver import ModelAliasResolver
 from infrastructure.plugins.base import ProviderRegistry
@@ -38,20 +41,29 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _allocation_pool_sequence(pool: KeyPool) -> tuple[KeyPool, ...]:
+    if pool == KeyPool.VIP:
+        return (KeyPool.VIP, KeyPool.DEFAULT)
+    return (KeyPool.DEFAULT,)
+
+
 @dataclass(slots=True)
 class CreateKeyInput:
     """Minimum input to add a new credential account."""
 
     provider: str
-    credential: dict[str, str]
+    credential: dict[str, Any]
+    pool: KeyPool = KeyPool.DEFAULT
+    max_concurrent_uses: int = 1
 
 
 @dataclass(slots=True)
 class UpdateKeyInput:
     """Fields that can be changed by the caller."""
 
-    credential: dict[str, str] | None = None
+    credential: dict[str, Any] | None = None
     status: KeyStatus | None = None
+    max_concurrent_uses: int | None = None
 
 
 @dataclass(slots=True)
@@ -104,12 +116,18 @@ class KeyService:
             id=str(uuid4()),
             provider=provider,
             credential=credential,
+            pool=data.pool,
+            max_concurrent_uses=max(data.max_concurrent_uses, 1),
             status=KeyStatus.PENDING,
             last_refreshed_at=now,
         )
         await self._repository.upsert_key(key)
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
         if key.status == KeyStatus.PENDING:
+            validated = await self.validate_pending_key(key.id)
+            latest = await self._repository.get_key(key.id) if validated else None
+            if latest is not None:
+                return latest
             self._schedule_pending_validation(key.id)
         return key
 
@@ -183,19 +201,17 @@ class KeyService:
                 if persisted is None:
                     raise KeyNotFoundError(f"key {key_id} not found")
                 key = persisted
+            elif key.status != KeyStatus.DISABLED_ADMIN:
+                persisted = await self._repository.update_status(
+                    key.id,
+                    data.status.value,
+                    None,
+                    utcnow(),
+                )
+                if persisted is None:
+                    raise KeyNotFoundError(f"key {key_id} not found")
+                key = persisted
             else:
-                if key.status != KeyStatus.DISABLED_ADMIN:
-                    persisted = await self._repository.update_status(
-                        key.id,
-                        data.status.value,
-                        None,
-                        utcnow(),
-                    )
-                    if persisted is None:
-                        raise KeyNotFoundError(f"key {key_id} not found")
-                    key = persisted
-                    await self._allocation_store.sync_key(key, self._scorer.score(key, utcnow()))
-                    return key
                 plugin = self._require_ready_provider(key.provider)
                 now = utcnow()
                 owner = f"restore_admin:{uuid4()}"
@@ -264,13 +280,21 @@ class KeyService:
                     key = persisted
                 finally:
                     await self._repository.release_runtime_lock(key.id, owner, utcnow())
+        if data.max_concurrent_uses is not None:
+            persisted = await self._repository.update_max_concurrent_uses(
+                key.id,
+                data.max_concurrent_uses,
+            )
+            if persisted is None:
+                raise KeyNotFoundError(f"key {key_id} not found")
+            key = persisted
         await self._allocation_store.sync_key(key, self._scorer.score(key, utcnow()))
         return key
 
     async def delete_key(self, key_id: str) -> None:
         key = await self._get_required_key(key_id)
         await self._repository.delete_key(key_id)
-        await self._allocation_store.remove_key(key_id, key.provider)
+        await self._allocation_store.remove_key(key_id, key.provider, key.pool)
 
     async def list_keys(self, provider: str | None = None) -> list[ApiKey]:
         return await self._repository.list_keys(provider=provider)
@@ -296,52 +320,176 @@ class KeyService:
             raise KeyNotFoundError(f"key {key_id} not found for provider {provider}")
         return list(key.supported_models)
 
-    async def allocate_key(self, provider: str, model: str | None = None) -> AllocationResult:
+    async def move_key_pool(self, key_id: str, pool: KeyPool) -> ApiKey:
+        key = await self._get_required_key(key_id)
+        if key.pool == pool:
+            return key
+
+        migrated = await self._repository.update_pool(key.id, pool)
+        if migrated is None:
+            raise KeyNotFoundError(f"key {key_id} not found")
+        await self._allocation_store.remove_key(key.id, key.provider, key.pool)
+        await self._allocation_store.sync_key(migrated, self._scorer.score(migrated, utcnow()))
+        return migrated
+
+    async def allocate_key(
+        self,
+        provider: str,
+        model: str | None = None,
+        pool: KeyPool = KeyPool.DEFAULT,
+    ) -> AllocationResult:
         now = utcnow()
         provider = provider.strip().lower()
-        keys = await self._repository.list_provider_keys(provider)
-        await self._recover_ready_keys(keys, now)
-        candidates, capacity_by_key_id, provider_model_by_key_id = await self._collect_candidates(
-            keys, model, now
-        )
+        last_error: NoAvailableKeyError | None = None
+        for candidate_pool in _allocation_pool_sequence(pool):
+            keys = await self._repository.list_provider_pool_keys(provider, candidate_pool)
+            await self._recover_ready_keys(keys, now)
+            candidates, capacity_by_key_id, provider_model_by_key_id = await self._collect_candidates(
+                keys, model, now
+            )
 
-        ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
-        if not ranked:
-            raise NoAvailableKeyError("no available key")
+            ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
+            if not ranked:
+                last_error = NoAvailableKeyError("no available key")
+                continue
 
-        ordered_ids = [item.key.id for item in ranked]
-        allocated_id = await self._allocation_store.allocate_key(
-            provider,
-            ordered_ids,
-            now,
-            lease_seconds=self._allocation_lease_seconds,
-        )
-        if allocated_id is None:
-            raise NoAvailableKeyError("no available key")
+            remaining_ranked = list(ranked)
+            cache_repaired = False
+            while remaining_ranked:
+                ordered_ids = [item.key.id for item in remaining_ranked]
+                allocated_id = await self._allocate_provider_candidate(
+                    provider,
+                    candidate_pool,
+                    ordered_ids,
+                    now,
+                )
+                if allocated_id is None:
+                    if not cache_repaired:
+                        await self._sync_ranked_candidates(remaining_ranked, now)
+                        cache_repaired = True
+                        continue
+                    last_error = NoAvailableKeyError("no available key")
+                    break
 
-        return await self._finalize_allocation(ranked, allocated_id, now, provider_model_by_key_id)
+                try:
+                    return await self._finalize_allocation(
+                        remaining_ranked,
+                        allocated_id,
+                        now,
+                        provider_model_by_key_id,
+                        lease_provider=provider,
+                        lease_pool=candidate_pool,
+                        requested_model=model,
+                    )
+                except NoAvailableKeyError as exc:
+                    last_error = exc
+                    remaining_ranked = [
+                        item for item in remaining_ranked if item.key.id != allocated_id
+                    ]
+                    continue
 
-    async def allocate_key_by_model(self, model: str) -> AllocationResult:
+        raise last_error or NoAvailableKeyError("no available key")
+
+    async def allocate_key_by_model(
+        self,
+        model: str,
+        pool: KeyPool = KeyPool.DEFAULT,
+    ) -> AllocationResult:
         now = utcnow()
-        keys = await self._repository.list_keys()
-        await self._recover_ready_keys(keys, now)
-        candidates, capacity_by_key_id, provider_model_by_key_id = await self._collect_candidates(
-            keys, model, now
-        )
+        last_error: NoAvailableKeyError | None = None
+        for candidate_pool in _allocation_pool_sequence(pool):
+            keys = await self._repository.list_pool_keys(candidate_pool)
+            await self._recover_ready_keys(keys, now)
+            candidates, capacity_by_key_id, provider_model_by_key_id = await self._collect_candidates(
+                keys, model, now
+            )
 
-        ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
-        if not ranked:
-            raise NoAvailableKeyError("no available key")
+            ranked = self._scheduler.rank_keys(candidates, now, capacity_by_key_id=capacity_by_key_id)
+            if not ranked:
+                last_error = NoAvailableKeyError("no available key")
+                continue
 
-        allocated_id = await self._allocation_store.allocate_key_any_provider(
-            [item.key for item in ranked],
-            now,
-            lease_seconds=self._allocation_lease_seconds,
-        )
-        if allocated_id is None:
-            raise NoAvailableKeyError("no available key")
+            remaining_ranked = list(ranked)
+            cache_repaired = False
+            while remaining_ranked:
+                allocated_id = await self._allocate_any_provider_candidate(
+                    candidate_pool,
+                    [item.key for item in remaining_ranked],
+                    now,
+                )
+                if allocated_id is None:
+                    if not cache_repaired:
+                        await self._sync_ranked_candidates(remaining_ranked, now)
+                        cache_repaired = True
+                        continue
+                    last_error = NoAvailableKeyError("no available key")
+                    break
 
-        return await self._finalize_allocation(ranked, allocated_id, now, provider_model_by_key_id)
+                lease_provider = self._ranked_provider_for_key(remaining_ranked, allocated_id)
+                if lease_provider is None:
+                    last_error = NoAvailableKeyError("no available key")
+                    remaining_ranked = [
+                        item for item in remaining_ranked if item.key.id != allocated_id
+                    ]
+                    continue
+                try:
+                    return await self._finalize_allocation(
+                        remaining_ranked,
+                        allocated_id,
+                        now,
+                        provider_model_by_key_id,
+                        lease_provider=lease_provider,
+                        lease_pool=candidate_pool,
+                        requested_model=model,
+                    )
+                except NoAvailableKeyError as exc:
+                    last_error = exc
+                    remaining_ranked = [
+                        item for item in remaining_ranked if item.key.id != allocated_id
+                    ]
+                    continue
+
+        raise last_error or NoAvailableKeyError("no available key")
+
+    async def _allocate_provider_candidate(
+        self,
+        provider: str,
+        pool: KeyPool,
+        ordered_ids: list[str],
+        now: datetime,
+    ) -> str | None:
+        try:
+            return await self._allocation_store.allocate_key(
+                provider,
+                pool,
+                ordered_ids,
+                now,
+                lease_seconds=self._allocation_lease_seconds,
+            )
+        except AllocationStoreUnavailableError:
+            raise
+        except Exception as exc:
+            logger.warning("allocation store provider allocation failed: %s", exc)
+            raise AllocationStoreUnavailableError("allocation store provider allocation failed") from exc
+
+    async def _allocate_any_provider_candidate(
+        self,
+        pool: KeyPool,
+        ordered_keys: list[ApiKey],
+        now: datetime,
+    ) -> str | None:
+        try:
+            return await self._allocation_store.allocate_key_any_provider(
+                pool,
+                ordered_keys,
+                now,
+                lease_seconds=self._allocation_lease_seconds,
+            )
+        except AllocationStoreUnavailableError:
+            raise
+        except Exception as exc:
+            logger.warning("allocation store model allocation failed: %s", exc)
+            raise AllocationStoreUnavailableError("allocation store model allocation failed") from exc
 
     async def _recover_ready_keys(self, keys: list[ApiKey], now: datetime) -> None:
         for key in keys:
@@ -390,27 +538,83 @@ class KeyService:
 
         return candidates, capacity_by_key_id, provider_model_by_key_id
 
+    async def _sync_ranked_candidates(self, ranked: list, now: datetime) -> None:
+        for item in ranked:
+            await self._allocation_store.sync_key(item.key, self._scorer.score(item.key, now))
+
+    @staticmethod
+    def _ranked_provider_for_key(ranked: list, key_id: str) -> str | None:
+        for item in ranked:
+            if item.key.id == key_id:
+                return item.key.provider
+        return None
+
+    @staticmethod
+    def _contains_ranked_key(ranked: list, key_id: str) -> bool:
+        return any(item.key.id == key_id for item in ranked)
+
     async def _finalize_allocation(
         self,
         ranked: list,
         allocated_id: str,
         now: datetime,
         provider_model_by_key_id: dict[str, str | None],
+        lease_provider: str,
+        lease_pool: KeyPool,
+        requested_model: str | None,
     ) -> AllocationResult:
-        selected = await self._get_required_key(allocated_id)
-        if not selected.is_available(now) or self._provider_registry.get(selected.provider) is None:
-            await self._allocation_store.release_key_lease(selected.provider, selected.id)
+        try:
+            selected = await self._get_required_key(allocated_id)
+        except KeyNotFoundError as exc:
+            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
+            raise NoAvailableKeyError("no available key") from exc
+
+        provider_model = self._resolve_current_provider_model(selected, requested_model)
+        if (
+            not self._contains_ranked_key(ranked, allocated_id)
+            or selected.id != allocated_id
+            or selected.provider != lease_provider
+            or selected.pool != lease_pool
+            or not selected.is_available(now)
+            or self._provider_registry.get(selected.provider) is None
+            or (requested_model is not None and provider_model is None)
+        ):
+            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
             raise NoAvailableKeyError("no available key")
-        selected.mark_used(now)
         persisted = await self._repository.touch_key_used(selected.id, now)
         if persisted is None:
-            await self._allocation_store.release_key_lease(selected.provider, selected.id)
+            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
             raise NoAvailableKeyError("no available key")
         selected = persisted
+        provider_model = self._resolve_current_provider_model(selected, requested_model)
+        if (
+            selected.id != allocated_id
+            or selected.provider != lease_provider
+            or selected.pool != lease_pool
+            or not selected.is_available(now)
+            or self._provider_registry.get(selected.provider) is None
+            or (requested_model is not None and provider_model is None)
+        ):
+            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
+            raise NoAvailableKeyError("no available key")
         await self._allocation_store.sync_key(selected, self._scorer.score(selected, now))
+        result_provider_model = (
+            provider_model
+            if requested_model is not None
+            else provider_model_by_key_id.get(selected.id)
+        )
         return AllocationResult(
             key=selected,
-            provider_model=provider_model_by_key_id.get(selected.id),
+            provider_model=result_provider_model,
+        )
+
+    def _resolve_current_provider_model(self, key: ApiKey, requested_model: str | None) -> str | None:
+        if requested_model is None:
+            return None
+        return self._model_alias_resolver.resolve_provider_model(
+            requested_model=requested_model,
+            provider=key.provider,
+            supported_models=list(key.supported_models),
         )
 
     async def report_success(self, key_id: str, tokens_used: int = 0) -> ApiKey:
@@ -418,17 +622,16 @@ class KeyService:
         key = await self._get_required_key(key_id)
         persisted = await self._repository.record_success(key_id, tokens_used, now)
         if persisted is None:
-            await self._allocation_store.release_key_lease(key.provider, key.id)
             raise KeyNotFoundError(f"key {key_id} not found")
         key = persisted
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
-        await self._allocation_store.release_key_lease(key.provider, key.id)
         plugin = self._provider_registry.get(key.provider)
         if plugin is not None:
             try:
                 await plugin.mark_success(key.credential, {"tokens_used": tokens_used})
             except Exception as exc:
                 logger.warning("mark_success failed for %s: %s", key.id, exc)
+        await self._allocation_store.release_key_lease(key.provider, key.pool, key.id)
         return key
 
     async def report_error(self, key_id: str, error_type: str) -> ApiKey:
@@ -436,17 +639,16 @@ class KeyService:
         key = await self._get_required_key(key_id)
         persisted = await self._repository.record_error(key_id, now)
         if persisted is None:
-            await self._allocation_store.release_key_lease(key.provider, key.id)
             raise KeyNotFoundError(f"key {key_id} not found")
         key = persisted
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
-        await self._allocation_store.release_key_lease(key.provider, key.id)
         plugin = self._provider_registry.get(key.provider)
         if plugin is not None:
             try:
                 await plugin.mark_error(key.credential, {"error_type": error_type})
             except Exception as exc:
                 logger.warning("mark_error failed for %s: %s", key.id, exc)
+        await self._allocation_store.release_key_lease(key.provider, key.pool, key.id)
         return key
 
     async def recover_cooldowns(self) -> int:
@@ -582,7 +784,7 @@ class KeyService:
         key: ApiKey,
         now: datetime,
         plugin=None,
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         """Refresh one key's availability/capacity cache and merge status."""
         plugin = plugin or self._provider_registry.get(key.provider)
         if plugin is None:
@@ -630,7 +832,7 @@ class KeyService:
         self._merge_refresh_signals_into_status(key, now)
         return probe_credential
 
-    async def _prepare_registration_credential(self, credential: dict[str, str], plugin) -> dict[str, str]:
+    async def _prepare_registration_credential(self, credential: dict[str, Any], plugin) -> dict[str, Any]:
         try:
             result = await plugin.prepare_credential(credential)
         except ValueError as exc:
@@ -692,7 +894,7 @@ class KeyService:
             return
         key.supported_models = []
 
-    async def _run_key_preflight(self, key: ApiKey, plugin) -> dict[str, str] | None:
+    async def _run_key_preflight(self, key: ApiKey, plugin) -> dict[str, Any] | None:
         auth_type = str(getattr(plugin, "auth_type", "") or "").lower()
         if "oauth" not in auth_type:
             return key.credential
@@ -757,7 +959,7 @@ class KeyService:
             raise KeyNotFoundError(f"key {key_id} not found")
         return key
 
-    async def _sync_models(self, key: ApiKey, plugin=None, credential: dict[str, str] | None = None) -> None:
+    async def _sync_models(self, key: ApiKey, plugin=None, credential: dict[str, Any] | None = None) -> None:
         """Fetch and store provider model list. Failures do not change status."""
         plugin = plugin or self._provider_registry.get(key.provider)
         if plugin is None:
@@ -769,7 +971,7 @@ class KeyService:
             logger.warning("fetch_models failed for %s: %s", key.id, exc)
 
     @staticmethod
-    async def _build_runtime_credential_for_refresh(credential: dict[str, str], plugin) -> dict[str, str]:
+    async def _build_runtime_credential_for_refresh(credential: dict[str, Any], plugin) -> dict[str, Any]:
         builder = getattr(plugin, "_build_runtime_credential", None)
         if callable(builder):
             return await builder(credential)
@@ -784,5 +986,5 @@ class KeyService:
         return plugin
 
     @staticmethod
-    def _credential_equals(left: dict[str, str], right: dict[str, str]) -> bool:
+    def _credential_equals(left: dict[str, Any], right: dict[str, Any]) -> bool:
         return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)

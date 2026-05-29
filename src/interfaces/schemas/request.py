@@ -1,15 +1,26 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-05-29
+@Description: API 请求数据模型
+"""
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator
 
+from domain.value_objects.key_pool import KeyPool
 from domain.value_objects.key_status import KeyStatus
 
 
 class AllocateRequest(BaseModel):
     provider: str
     model: str | None = None
+    pool: KeyPool = KeyPool.DEFAULT
 
 
 class AllocateByModelRequest(BaseModel):
     model: str
+    pool: KeyPool = KeyPool.DEFAULT
 
 
 class ReportErrorRequest(BaseModel):
@@ -29,7 +40,9 @@ class CreateKeyRequest(BaseModel):
     Other info (balance, pricing, models) is fetched from the provider plugin.
     """
 
-    credential: dict[str, str]
+    credential: dict[str, Any]
+    pool: KeyPool = KeyPool.DEFAULT
+    max_concurrent_uses: int = Field(default=1, ge=1)
 
 
 class UpdateKeyRequest(BaseModel):
@@ -39,8 +52,9 @@ class UpdateKeyRequest(BaseModel):
     Balance / pricing / quota data is managed by the plugin sync, not user input.
     """
 
-    credential: dict[str, str] | None = None
+    credential: dict[str, Any] | None = None
     status: KeyStatus | None = None
+    max_concurrent_uses: int | None = Field(default=None, ge=1)
 
     @field_validator("status")
     @classmethod
@@ -50,3 +64,7 @@ class UpdateKeyRequest(BaseModel):
         if value in {KeyStatus.AVAILABLE, KeyStatus.DISABLED_ADMIN}:
             return value
         raise ValueError("status must be one of: available, disabled_admin")
+
+
+class MoveKeyPoolRequest(BaseModel):
+    pool: KeyPool

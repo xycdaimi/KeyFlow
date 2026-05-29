@@ -1,14 +1,16 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-21
+@Date: 2026-05-29
 @Description: API Key 领域实体
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
+from domain.value_objects.key_pool import KeyPool
 from domain.value_objects.key_status import KeyStatus
 
 
@@ -30,9 +32,12 @@ class ApiKey:
 
     id: str
     provider: str
-    credential: dict[str, str]
+    credential: dict[str, Any]
     """Provider-defined credential payload, e.g. {"api_key": "..."}."""
 
+    pool: KeyPool = KeyPool.DEFAULT
+    max_concurrent_uses: int = 1
+    """Maximum active allocations allowed for this credential at the same time."""
     status: KeyStatus = KeyStatus.AVAILABLE
     quota_used: int = 0
     """Token / request counter maintained by the core for scoring purposes."""

@@ -21,10 +21,78 @@
 - **默认并发**：`.env.example` 与 `docker/src/Dockerfile` 中 `UVICORN_WORKERS` 默认为 **1**；需要扩展 HTTP 吞吐时只增加 API 进程，后台周期任务仍由 worker 负责。
 
 ## 本地开发
+
+### 启动顺序
+
+多服务器部署时推荐顺序是：
+
+1. 先启动 Gateway 控制面服务。
+2. 再启动各个子节点 KeyFlow 服务。
+
+原因：子节点是主动向 gateway 注册和发送心跳，不是由 gateway 扫描发现子节点。子节点如果先启动，会按重试逻辑继续尝试注册，但正式部署和本地联调都应先让 gateway 可达。
+
+### Gateway 控制面服务
+
+Gateway 是独立服务，使用 `.env.gateway`，不使用子节点的 `.env`。它只负责 ai_router 管理面：节点注册、心跳、能力聚合和凭证管理请求转发，不负责运行时分配。
+
 ```bash
 pip install -e .[dev]
+cp .env.gateway.example .env.gateway
+uvicorn gateway.main:app --reload --app-dir src --host 0.0.0.0 --port 8001
+```
+
+Gateway 的入口是：
+
+```text
+gateway.main:app
+```
+
+Gateway 配置文件中的关键变量：
+
+```env
+APP_NAME=KeyFlow Gateway
+APP_VERSION=0.1.0
+API_PREFIX=/api/gateway
+KEYFLOW_RUNTIME_MODE=local
+LOCAL_SQLITE_PATH=data/keyflow_gateway.db
+GATEWAY_INTERNAL_KEY=change-me-gateway-admin
+GATEWAY_REGISTER_KEY=change-me-gateway-register
+```
+
+### 子节点 KeyFlow 服务
+
+子节点服务使用根目录 `.env`。这是原有账户池服务，负责本机/同出口 IP 的凭证存储、分配、上报和供应商插件调用。
+
+```bash
+cp .env.example .env
 uvicorn main:app --reload --app-dir src
 python src/worker_main.py
+```
+
+子节点如果需要注册到 gateway，在 `.env` 中配置这一组可选变量：
+
+```env
+GATEWAY_URL=http://keyflow-gateway:8001
+GATEWAY_REGISTER_KEY=change-me-gateway-register
+NODE_ID=node-shanghai-01
+NODE_DISPLAY_NAME=Shanghai Node 01
+NODE_PUBLIC_BASE_URL=http://keyflow-node-01:8000
+NODE_TAGS=shanghai,telecom
+NODE_HEARTBEAT_INTERVAL_SECONDS=30
+```
+
+这些变量不完整时，子节点不会启动 gateway 注册客户端，原有本地分配、上报和管理接口不受影响。
+
+容器部署时也按两个 env 文件拆开：
+
+```bash
+# 1. Gateway 容器
+docker run --env-file .env.gateway <keyflow-image> \
+  uvicorn gateway.main:app --host 0.0.0.0 --port 8001 --app-dir src
+
+# 2. 子节点容器
+docker run --env-file .env <keyflow-image> \
+  uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir src
 ```
 
 测试建议：
@@ -43,46 +111,57 @@ python -m pytest tests/test_api.py tests/test_provider_plugins.py tests/test_red
 
 ```bash
 cp .env.example .env
+cp .env.gateway.example .env.gateway
 ```
 
-`docker/src/docker-compose.yml` 只使用根 `.env` 中的原始变量名；
-启动脚本会通过 `--env-file .env` 显式传入。
+`docker/gateway/docker-compose.yml` 使用 `.env.gateway`；`docker/src/docker-compose.yml` 使用 `.env`。
+启动脚本会通过 `--env-file` 显式传入对应 env 文件。
 
-2) 使用原有脚本手动启动基础依赖：
+2) 启动 Gateway 控制面：
+
+```bash
+./scripts/start_gateway.sh
+```
+
+3) 启动子节点依赖：
 
 ```bash
 ./scripts/start_postgre.sh
 ./scripts/start_redis.sh
 ```
 
-3) 使用原有脚本手动启动应用栈：
+4) 启动子节点 API/worker：
 
 ```bash
 ./scripts/start_src.sh
 ```
 
-4) `keyflow-api` 启动时自动检查并创建缺失表（已存在表不会重复创建）；`keyflow-worker` 复用同一镜像与配置，单独执行周期后台任务。
+`keyflow-gateway` 先启动并等待子节点主动注册；`keyflow-api` 启动时会读取 `.env` 中的 `GATEWAY_URL`、`GATEWAY_REGISTER_KEY`、`NODE_ID`、`NODE_PUBLIC_BASE_URL`，配置完整时向 gateway 注册并持续发送心跳。`keyflow-worker` 复用同一镜像与 `.env`，单独执行周期后台任务。
 
 5) 手动检查服务健康：
 
 ```bash
+curl http://localhost:8001/openapi.json
 curl http://localhost:8000/health
+docker compose -f docker/gateway/docker-compose.yml ps
 docker compose -f docker/src/docker-compose.yml ps
 ```
 
-本地 compose 表达的是“一个整体部署单元里的两个运行时角色”；生产 Kubernetes 目标是 **same Pod, two containers**，而不是单独的 worker Deployment。
+本地 compose 中 gateway 是独立控制面服务；子节点仍表达为“一个整体部署单元里的两个运行时角色”。生产 Kubernetes 中，每个子节点仍是 **same Pod, two containers**（API + worker），gateway 单独部署。
 
 6) 关闭：
 
 ```bash
-docker compose -f docker/src/docker-compose.yml down
-docker compose -f docker/redis/docker-compose.yml down
-docker compose -f docker/postgresql/docker-compose.yml down
+./scripts/stop_src.sh
+./scripts/stop_redis.sh
+./scripts/stop_postgre.sh
+./scripts/stop_gateway.sh
 ```
 
 ## scripts 便捷命令（按组件）
 
 ```bash
+./scripts/start_gateway.sh
 ./scripts/start_postgre.sh
 ./scripts/start_redis.sh
 ./scripts/start_src.sh
@@ -94,33 +173,40 @@ docker compose -f docker/postgresql/docker-compose.yml down
 ./scripts/stop_src.sh
 ./scripts/stop_redis.sh
 ./scripts/stop_postgre.sh
+./scripts/stop_gateway.sh
 ```
 
 Windows（cmd/powershell）：
 
 ```bat
+scripts\start_gateway.bat
 scripts\start_postgre.bat
 scripts\start_redis.bat
 scripts\start_src.bat
 scripts\stop_src.bat
 scripts\stop_redis.bat
 scripts\stop_postgre.bat
+scripts\stop_gateway.bat
 ```
 
 启动/停止可选参数：
 
 ```bash
+./scripts/start_gateway.sh --no-build
 ./scripts/start_src.sh --no-build
 ./scripts/stop_src.sh --volumes
 ./scripts/stop_redis.sh --volumes
 ./scripts/stop_postgre.sh --volumes
+./scripts/stop_gateway.sh --volumes
 ```
 
 ```bat
+scripts\start_gateway.bat --no-build
 scripts\start_src.bat --no-build
 scripts\stop_src.bat --volumes
 scripts\stop_redis.bat --volumes
 scripts\stop_postgre.bat --volumes
+scripts\stop_gateway.bat --volumes
 ```
 
 ## Model Alias Config

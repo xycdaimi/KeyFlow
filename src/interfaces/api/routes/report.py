@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-05-29
+@Description: 内部执行结果上报 API
+"""
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -23,6 +29,7 @@ def _key_response(key: ApiKey) -> KeyResponse:
         quota_used=key.quota_used,
         last_used_at=key.last_used_at,
         cooldown_until=key.cooldown_until,
+        max_concurrent_uses=key.max_concurrent_uses,
     )
 
 

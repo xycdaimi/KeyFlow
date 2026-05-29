@@ -1,3 +1,9 @@
+"""
+@Author: xycdaimi
+@Email: xycdaimi@gmail.com
+@Date: 2026-05-29
+@Description: Redis Key 分配缓存与短租约
+"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -7,6 +13,7 @@ from redis.asyncio import Redis
 
 from domain.entities.api_key import ApiKey
 from domain.repositories.key_repository import KeyAllocationStore
+from domain.value_objects.key_pool import KeyPool
 
 
 def to_epoch(value: datetime | None) -> str:
@@ -19,18 +26,19 @@ class RedisKeyCache(KeyAllocationStore):
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
         self._script = Path(__file__).with_name("lua").joinpath("allocate.lua").read_text(encoding="utf-8")
+        self._release_script = Path(__file__).with_name("lua").joinpath("release.lua").read_text(encoding="utf-8")
 
-    def _provider_zset(self, provider: str) -> str:
-        return f"keyflow:provider:{provider}:keys"
+    def _provider_zset(self, provider: str, pool: KeyPool) -> str:
+        return f"keyflow:provider:{provider}:pool:{pool.value}:keys"
 
     def _key_hash(self, key_id: str) -> str:
         return f"keyflow:key:{key_id}"
 
-    def _provider_lease_zset(self, provider: str) -> str:
-        return f"keyflow:provider:{provider}:leases"
+    def _provider_lease_zset(self, provider: str, pool: KeyPool) -> str:
+        return f"keyflow:provider:{provider}:pool:{pool.value}:leases"
 
     async def sync_key(self, key: ApiKey, score: float) -> None:
-        zset_key = self._provider_zset(key.provider)
+        zset_key = self._provider_zset(key.provider, key.pool)
         hash_key = self._key_hash(key.id)
 
         await self._redis.zadd(zset_key, {key.id: score})
@@ -41,49 +49,75 @@ class RedisKeyCache(KeyAllocationStore):
                 "status": key.status.value,
                 "cooldown_until": to_epoch(key.cooldown_until),
                 "last_used_at": to_epoch(key.last_used_at),
+                "max_concurrent_uses": str(max(key.max_concurrent_uses, 1)),
             },
         )
 
-    async def remove_key(self, key_id: str, provider: str) -> None:
-        await self._redis.zrem(self._provider_zset(provider), key_id)
+    async def remove_key(self, key_id: str, provider: str, pool: KeyPool) -> None:
+        await self._redis.zrem(self._provider_zset(provider, pool), key_id)
         await self._redis.delete(self._key_hash(key_id))
 
     async def allocate_key(
         self,
         provider: str,
+        pool: KeyPool,
         ordered_key_ids: list[str],
         now: datetime,
         lease_seconds: int = 2,
+        allow_leased_fallback: bool = True,
     ) -> str | None:
         if not ordered_key_ids:
             return None
         result = await self._redis.eval(
             self._script,
             2,
-            self._provider_zset(provider),
-            self._provider_lease_zset(provider),
+            self._provider_zset(provider, pool),
+            self._provider_lease_zset(provider, pool),
             str(int(now.astimezone(timezone.utc).timestamp())),
             str(max(lease_seconds, 1)),
+            "1" if allow_leased_fallback else "0",
             *ordered_key_ids,
         )
         return result if isinstance(result, str) and result else None
 
     async def allocate_key_any_provider(
         self,
+        pool: KeyPool,
         ordered_keys: list[ApiKey],
         now: datetime,
         lease_seconds: int = 2,
+        allow_leased_fallback: bool = True,
     ) -> str | None:
         for key in ordered_keys:
             allocated_id = await self.allocate_key(
                 key.provider,
+                pool,
                 [key.id],
                 now,
                 lease_seconds=lease_seconds,
+                allow_leased_fallback=False,
+            )
+            if allocated_id is not None:
+                return allocated_id
+        if not allow_leased_fallback:
+            return None
+        for key in ordered_keys:
+            allocated_id = await self.allocate_key(
+                key.provider,
+                pool,
+                [key.id],
+                now,
+                lease_seconds=lease_seconds,
+                allow_leased_fallback=True,
             )
             if allocated_id is not None:
                 return allocated_id
         return None
 
-    async def release_key_lease(self, provider: str, key_id: str) -> None:
-        await self._redis.zrem(self._provider_lease_zset(provider), key_id)
+    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str) -> None:
+        await self._redis.eval(
+            self._release_script,
+            1,
+            self._provider_lease_zset(provider, pool),
+            key_id,
+        )

@@ -1,0 +1,40 @@
+name: keyflow
+
+services:
+  keyflow-gateway:
+    container_name: keyflow-gateway
+    build:
+      context: ../..
+      dockerfile: docker/src/Dockerfile
+    command:
+      [
+        "sh",
+        "-c",
+        "uvicorn gateway.main:app --host 0.0.0.0 --port ${PORT:-8001} --app-dir src --workers ${UVICORN_WORKERS:-1}",
+      ]
+    env_file:
+      - ../../.env.gateway
+    volumes:
+      - keyflow-gateway-data:/app/data
+    ports:
+      - "${PORT:-8001}:${PORT:-8001}"
+    networks:
+      - keyflow-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; p=os.environ.get('PORT','8001'); urllib.request.urlopen(f'http://127.0.0.1:{p}/openapi.json', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  keyflow-gateway-data:
+
+networks:
+  keyflow-network:
+    driver: bridge

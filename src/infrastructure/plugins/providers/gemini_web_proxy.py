@@ -1,12 +1,13 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-22
+@Date: 2026-05-19
 @Description: Gemini Web（Cookie / gemini-webapi）供应商插件
 """
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 
@@ -85,14 +86,14 @@ class GeminiWebProxyPlugin(ProviderPlugin):
     async def verify_upstream_root_reachable(self) -> None:
         await self._ensure_upstream_root_http_reachable(_GEMINI_WEB_ORIGIN, httpx.AsyncClient)
 
-    async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+    async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
         """Return the static list of known Gemini Web models.
 
         The gemini_webapi library does not provide a model-list endpoint.
         """
         return list(_KNOWN_MODELS)
 
-    async def is_credential_available(self, credential: dict[str, str]) -> bool:
+    async def is_credential_available(self, credential: dict[str, Any]) -> bool:
         """Verify the cookie is still valid using the gemini_webapi library."""
         if not self._is_dependency_available():
             logger.warning(
@@ -103,8 +104,8 @@ class GeminiWebProxyPlugin(ProviderPlugin):
 
         try:
             from gemini_webapi import GeminiClient  # type: ignore[import]
-            secure_1psid = credential["secure_1psid"]
-            secure_1psidts = credential["secure_1psidts"]
+            secure_1psid = str(credential["secure_1psid"])
+            secure_1psidts = str(credential["secure_1psidts"])
             client = GeminiClient(
                 secure_1psid=secure_1psid,
                 secure_1psidts=secure_1psidts,
@@ -116,10 +117,10 @@ class GeminiWebProxyPlugin(ProviderPlugin):
             logger.debug("GeminiWebProxyPlugin cookie check failed: %s", exc)
             return False
 
-    async def explain_credential(self, credential: dict[str, str]) -> dict:
+    async def explain_credential(self, credential: dict[str, Any]) -> dict:
         dependency_available = self._is_dependency_available()
-        secure_1psid = credential.get("secure_1psid", "")
-        secure_1psidts = credential.get("secure_1psidts", "")
+        secure_1psid = str(credential.get("secure_1psid", ""))
+        secure_1psidts = str(credential.get("secure_1psidts", ""))
         return {
             "provider": self.name,
             "status": "unknown" if dependency_available else "dependency_missing",

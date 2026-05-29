@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-13
+@Date: 2026-05-19
 @Description: 应用运行时配置
 """
 from functools import lru_cache
@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     http_read_timeout: float = Field(default=8.0, alias="HTTP_READ_TIMEOUT")
     http_total_timeout: float = Field(default=12.0, alias="HTTP_TOTAL_TIMEOUT")
     """Default HTTP timeout settings for provider plugin upstream calls."""
+    gateway_url: str | None = Field(default=None, alias="GATEWAY_URL")
+    gateway_register_key: str | None = Field(default=None, alias="GATEWAY_REGISTER_KEY")
+    node_id: str | None = Field(default=None, alias="NODE_ID")
+    node_display_name: str | None = Field(default=None, alias="NODE_DISPLAY_NAME")
+    node_public_base_url: str | None = Field(default=None, alias="NODE_PUBLIC_BASE_URL")
+    node_tags: str | None = Field(default=None, alias="NODE_TAGS")
+    node_heartbeat_interval_seconds: int = Field(default=30, alias="NODE_HEARTBEAT_INTERVAL_SECONDS")
 
 
 @lru_cache(maxsize=1)

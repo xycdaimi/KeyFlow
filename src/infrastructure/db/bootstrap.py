@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-13
+@Date: 2026-05-29
 @Description: PostgreSQL 写库启动引导
 """
 from __future__ import annotations
@@ -81,9 +81,20 @@ async def ensure_refresh_columns(conn) -> None:
         ("runtime_lock_until", "TIMESTAMP WITH TIME ZONE"),
         ("runtime_lock_reason", "VARCHAR(64)"),
         ("credential_fingerprint", "VARCHAR(64)"),
+        ("pool", "VARCHAR(32) DEFAULT 'default'"),
+        ("max_concurrent_uses", "INTEGER DEFAULT 1"),
     ]:
         await conn.execute(
             text(f"ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS {col} {sql_type}")
+        )
+
+
+async def ensure_lease_columns(conn) -> None:
+    for col, sql_type in [
+        ("active_count", "INTEGER DEFAULT 1"),
+    ]:
+        await conn.execute(
+            text(f"ALTER TABLE key_leases ADD COLUMN IF NOT EXISTS {col} {sql_type}")
         )
 
 
@@ -113,6 +124,19 @@ async def backfill_credential_fingerprints(conn) -> None:
         )
 
 
+async def backfill_key_pools(conn) -> None:
+    await conn.execute(text("UPDATE api_keys SET pool = 'default' WHERE pool IS NULL"))
+
+
+async def backfill_concurrency_limits(conn) -> None:
+    await conn.execute(
+        text("UPDATE api_keys SET max_concurrent_uses = 1 WHERE max_concurrent_uses IS NULL")
+    )
+    await conn.execute(
+        text("UPDATE key_leases SET active_count = 1 WHERE active_count IS NULL")
+    )
+
+
 async def ensure_credential_fingerprint_not_null(conn) -> None:
     await conn.execute(
         text("ALTER TABLE api_keys ALTER COLUMN credential_fingerprint SET NOT NULL")
@@ -124,6 +148,9 @@ async def bootstrap_write_database(database_url: str, write_engine) -> None:
     await ensure_schema_ready(write_engine)
     async with write_engine.begin() as conn:
         await ensure_refresh_columns(conn)
+        await ensure_lease_columns(conn)
+        await backfill_key_pools(conn)
+        await backfill_concurrency_limits(conn)
         await backfill_credential_fingerprints(conn)
         await ensure_credential_fingerprint_not_null(conn)
         await ensure_credential_uniqueness(conn)

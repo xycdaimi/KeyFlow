@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-27
+@Date: 2026-05-29
 @Description: 管理端 API（Key / Provider 维护）
 """
 from typing import Annotated
@@ -23,7 +23,7 @@ from infrastructure.config.settings import Settings
 from infrastructure.plugins.base import ProviderRegistry
 from interfaces.api.deps import get_key_service, get_provider_registry, get_settings
 from interfaces.middleware.auth import verify_internal_key
-from interfaces.schemas.request import CreateKeyRequest, UpdateKeyRequest
+from interfaces.schemas.request import CreateKeyRequest, MoveKeyPoolRequest, UpdateKeyRequest
 from interfaces.schemas.response import (
     AdminKeyDetailResponse,
     AdminKeyListItemResponse,
@@ -48,6 +48,8 @@ def _to_list_item_response(key: ApiKey) -> AdminKeyListItemResponse:
     return AdminKeyListItemResponse(
         key_id=key.id,
         credential=key.credential,
+        pool=key.pool,
+        max_concurrent_uses=key.max_concurrent_uses,
         status=key.status,
     )
 
@@ -55,6 +57,8 @@ def _to_list_item_response(key: ApiKey) -> AdminKeyListItemResponse:
 def _to_detail_response(key: ApiKey) -> AdminKeyDetailResponse:
     return AdminKeyDetailResponse(
         credential=key.credential,
+        pool=key.pool,
+        max_concurrent_uses=key.max_concurrent_uses,
         status=key.status,
     )
 
@@ -66,7 +70,14 @@ async def create_key(
     service: KeyService = Depends(get_key_service),
 ) -> CreateKeyResponse:
     try:
-        key = await service.create_key(CreateKeyInput(provider=provider, credential=payload.credential))
+        key = await service.create_key(
+            CreateKeyInput(
+                provider=provider,
+                credential=payload.credential,
+                pool=payload.pool,
+                max_concurrent_uses=payload.max_concurrent_uses,
+            )
+        )
     except DuplicateCredentialError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate_credential") from exc
     except ProviderNotFoundError as exc:
@@ -124,7 +135,14 @@ async def update_key(
     service: KeyService = Depends(get_key_service),
 ) -> OperationStatusResponse:
     try:
-        await service.update_key(key_id, UpdateKeyInput(credential=payload.credential, status=payload.status))
+        await service.update_key(
+            key_id,
+            UpdateKeyInput(
+                credential=payload.credential,
+                status=payload.status,
+                max_concurrent_uses=payload.max_concurrent_uses,
+            ),
+        )
     except DuplicateCredentialError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="duplicate_credential") from exc
     except KeyNotFoundError as exc:
@@ -142,6 +160,19 @@ async def update_key(
         ) from exc
     except InvalidCredentialError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return OperationStatusResponse(status="ok")
+
+
+@router.put("/keys/{key_id}/pool", response_model=OperationStatusResponse)
+async def move_key_pool(
+    key_id: str,
+    payload: MoveKeyPoolRequest,
+    service: KeyService = Depends(get_key_service),
+) -> OperationStatusResponse:
+    try:
+        await service.move_key_pool(key_id, payload.pool)
+    except KeyNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key_not_found") from exc
     return OperationStatusResponse(status="ok")
 
 

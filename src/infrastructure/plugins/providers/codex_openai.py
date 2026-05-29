@@ -1,10 +1,12 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-16
+@Date: 2026-05-19
 @Description: CodeX 官方 API 供应商插件
 """
 from __future__ import annotations
+
+from typing import Any
 
 import httpx
 
@@ -39,8 +41,8 @@ class CodexOpenAiPlugin(ProviderPlugin):
         return "direct"
 
     @staticmethod
-    def _api_key(credential: dict[str, str]) -> str:
-        return credential["api_key"]
+    def _api_key(credential: dict[str, Any]) -> str:
+        return str(credential["api_key"])
 
     async def verify_upstream_root_reachable(self) -> None:
         await self._ensure_upstream_root_http_reachable(_ROOT_ORIGIN, httpx.AsyncClient)
@@ -75,7 +77,7 @@ class CodexOpenAiPlugin(ProviderPlugin):
         )
         return any(marker in error_text for marker in quota_markers)
 
-    async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+    async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
         api_key = self._api_key(credential)
         async with self._build_http_client(httpx.AsyncClient) as client:
             response = await client.get(
@@ -85,7 +87,7 @@ class CodexOpenAiPlugin(ProviderPlugin):
             response.raise_for_status()
             return [item["id"] for item in response.json().get("data", [])]
 
-    async def is_credential_available(self, credential: dict[str, str]) -> bool:
+    async def is_credential_available(self, credential: dict[str, Any]) -> bool:
         """Credential-level availability only."""
         api_key = self._api_key(credential)
         async with self._build_http_client(httpx.AsyncClient) as client:
@@ -97,7 +99,7 @@ class CodexOpenAiPlugin(ProviderPlugin):
                 return False
             return True
 
-    async def get_capacity_signal(self, credential: dict[str, str]) -> CapacitySignal | None:
+    async def get_capacity_signal(self, credential: dict[str, Any]) -> CapacitySignal | None:
         api_key = self._api_key(credential)
         try:
             async with self._build_http_client(httpx.AsyncClient) as client:
@@ -127,7 +129,7 @@ class CodexOpenAiPlugin(ProviderPlugin):
             )
         return None
 
-    async def explain_credential(self, credential: dict[str, str]) -> dict:
+    async def explain_credential(self, credential: dict[str, Any]) -> dict:
         api_key = self._api_key(credential)
         return {
             "provider": self.name,

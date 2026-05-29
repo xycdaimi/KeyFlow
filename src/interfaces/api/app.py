@@ -1,13 +1,13 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-13
+@Date: 2026-05-19
 @Description: FastAPI 应用工厂与生命周期资源管理
 """
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 import logging
 
 import punq
@@ -25,6 +25,7 @@ from interfaces.api.routes.admin import router as admin_router
 from interfaces.api.routes.allocate import router as allocate_router
 from interfaces.api.routes.health import router as health_router
 from interfaces.api.routes.report import router as report_router
+from interfaces.workers.gateway_client import build_gateway_client_config, run_gateway_client
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ async def lifespan(app: FastAPI):
     write_engine = repository._write_factory.kw["bind"]
     read_engine = repository._read_factory.kw["bind"]
     redis_cache: RedisKeyCache | None = None
+    gateway_stop_event: asyncio.Event | None = None
+    gateway_task: asyncio.Task | None = None
 
     if getattr(app.state.settings, "runtime_mode", "dev") == "local":
         await bootstrap_sqlite_database(
@@ -57,9 +60,20 @@ async def lifespan(app: FastAPI):
             write_engine,
         )
 
+    gateway_config = build_gateway_client_config(app.state.settings)
+    if gateway_config is not None:
+        gateway_stop_event = asyncio.Event()
+        gateway_task = asyncio.create_task(run_gateway_client(gateway_config, gateway_stop_event))
+
     try:
         yield
     finally:
+        if gateway_stop_event is not None:
+            gateway_stop_event.set()
+        if gateway_task is not None:
+            gateway_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await gateway_task
         if redis_cache is not None:
             await redis_cache._redis.aclose()
         await write_engine.dispose()

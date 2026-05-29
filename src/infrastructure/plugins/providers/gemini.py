@@ -1,10 +1,12 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-18
+@Date: 2026-05-19
 @Description: Google Gemini official API provider plugin
 """
 from __future__ import annotations
+
+from typing import Any
 
 import httpx
 from google import genai
@@ -61,11 +63,13 @@ class GeminiPlugin(ProviderPlugin):
         return True
 
     @staticmethod
-    def _api_key(credential: dict[str, str]) -> str:
-        return credential["api_key"]
+    def _api_key(credential: dict[str, Any]) -> str:
+        return str(credential["api_key"])
 
     @staticmethod
-    def _is_vertexai(credential: dict[str, str]) -> bool:
+    def _is_vertexai(credential: dict[str, Any]) -> bool:
+        if credential.get("vertexai") is True:
+            return True
         return str(credential.get("vertexai", "")).strip().lower() in _VERTEXAI_TRUE_VALUES
 
     @staticmethod
@@ -81,7 +85,7 @@ class GeminiPlugin(ProviderPlugin):
     async def verify_upstream_root_reachable(self) -> None:
         await self._ensure_upstream_root_http_reachable(_BASE_URL, httpx.AsyncClient)
 
-    def _build_genai_client(self, credential: dict[str, str]):
+    def _build_genai_client(self, credential: dict[str, Any]):
         api_key = self._api_key(credential)
         vertexai = self._is_vertexai(credential)
         endpoint = str(credential.get("endpoint", "")).strip()
@@ -142,7 +146,7 @@ class GeminiPlugin(ProviderPlugin):
         method_names = str(cls._model_field(supported_actions, "method_names", "methodNames") or "")
         return "generateContent" in method_names
 
-    async def fetch_models(self, credential: dict[str, str]) -> list[str]:
+    async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
         if self._is_vertexai(credential):
             return list(_VERTEXAI_MODELS)
 
@@ -159,7 +163,7 @@ class GeminiPlugin(ProviderPlugin):
             await aio_client.aclose()
         return model_ids
 
-    async def is_credential_available(self, credential: dict[str, str]) -> bool:
+    async def is_credential_available(self, credential: dict[str, Any]) -> bool:
         client = self._build_genai_client(credential)
         aio_client = client.aio
         try:
@@ -190,7 +194,7 @@ class GeminiPlugin(ProviderPlugin):
                 return model_id
         return None
 
-    async def explain_credential(self, credential: dict[str, str]) -> dict:
+    async def explain_credential(self, credential: dict[str, Any]) -> dict:
         api_key = self._api_key(credential)
         info = {
             "provider": self.name,

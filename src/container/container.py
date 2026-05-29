@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-13
+@Date: 2026-05-21
 @Description: 应用依赖注入容器
 """
 from __future__ import annotations
@@ -13,6 +13,8 @@ from application.services.model_alias_resolver import ModelAliasResolver
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer, ScoreWeights
 from domain.services.state_machine import KeyStateMachine
+from infrastructure.cache.composite_key_cache import CompositeKeyCache
+from infrastructure.cache.db_key_cache import DatabaseKeyCache
 from infrastructure.cache.key_cache import RedisKeyCache
 from infrastructure.cache.redis_client import create_redis_client
 from infrastructure.cache.sqlite_key_cache import SqliteKeyCache
@@ -39,7 +41,9 @@ def create_container(settings: Settings) -> punq.Container:
         )
         redis = create_redis_client(settings.redis_url)
         repository = SqlAlchemyKeyRepository(read_factory, write_factory)
-        allocation_store = RedisKeyCache(redis)
+        redis_store = RedisKeyCache(redis)
+        database_store = DatabaseKeyCache(write_factory)
+        allocation_store = CompositeKeyCache(redis_store, database_store)
     else:
         raise ValueError("KEYFLOW_RUNTIME_MODE must be one of: dev, local")
 
@@ -91,8 +95,10 @@ def create_container(settings: Settings) -> punq.Container:
     container.register(ProviderRegistry, instance=provider_registry)
     container.register(ModelAliasResolver, instance=model_alias_resolver)
     container.register(SqlAlchemyKeyRepository, instance=repository)
-    if isinstance(allocation_store, RedisKeyCache):
-        container.register(RedisKeyCache, instance=allocation_store)
+    if isinstance(allocation_store, CompositeKeyCache):
+        container.register(CompositeKeyCache, instance=allocation_store)
+        container.register(RedisKeyCache, instance=redis_store)
+        container.register(DatabaseKeyCache, instance=database_store)
     if isinstance(allocation_store, SqliteKeyCache):
         container.register(SqliteKeyCache, instance=allocation_store)
     container.register(KeyService, instance=service)

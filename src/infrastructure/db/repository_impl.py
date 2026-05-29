@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-13
+@Date: 2026-05-29
 @Description: SQLAlchemy Key 仓储实现
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import and_, or_
 from sqlalchemy import select, update
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from domain.entities.api_key import ApiKey
 from domain.exceptions.domain_exceptions import DuplicateCredentialError
 from domain.repositories.key_repository import KeyRepository
+from domain.value_objects.key_pool import KeyPool
 from domain.value_objects.key_status import KeyStatus
 from infrastructure.db.models import ApiKeyModel
 
@@ -51,11 +53,32 @@ class SqlAlchemyKeyRepository(KeyRepository):
     async def list_provider_keys(self, provider: str) -> list[ApiKey]:
         return await self.list_keys(provider)
 
+    async def list_provider_pool_keys(self, provider: str, pool: KeyPool) -> list[ApiKey]:
+        async with self._read_factory() as session:
+            stmt = (
+                select(ApiKeyModel)
+                .where(ApiKeyModel.provider == provider)
+                .where(ApiKeyModel.pool == pool.value)
+                .order_by(ApiKeyModel.provider, ApiKeyModel.id)
+            )
+            result = await session.execute(stmt)
+            return [self._to_entity(row) for row in result.scalars().all()]
+
     async def list_keys(self, provider: str | None = None) -> list[ApiKey]:
         async with self._read_factory() as session:
             stmt = select(ApiKeyModel).order_by(ApiKeyModel.provider, ApiKeyModel.id)
             if provider:
                 stmt = stmt.where(ApiKeyModel.provider == provider)
+            result = await session.execute(stmt)
+            return [self._to_entity(row) for row in result.scalars().all()]
+
+    async def list_pool_keys(self, pool: KeyPool) -> list[ApiKey]:
+        async with self._read_factory() as session:
+            stmt = (
+                select(ApiKeyModel)
+                .where(ApiKeyModel.pool == pool.value)
+                .order_by(ApiKeyModel.provider, ApiKeyModel.id)
+            )
             result = await session.execute(stmt)
             return [self._to_entity(row) for row in result.scalars().all()]
 
@@ -80,7 +103,7 @@ class SqlAlchemyKeyRepository(KeyRepository):
         )
 
     async def get_by_provider_credential(
-        self, provider: str, credential: dict[str, str]
+        self, provider: str, credential: dict[str, Any]
     ) -> ApiKey | None:
         keys = await self.list_provider_keys(provider)
         for key in keys:
@@ -98,6 +121,8 @@ class SqlAlchemyKeyRepository(KeyRepository):
                     session.add(model)
 
                 model.provider = key.provider
+                model.pool = key.pool.value
+                model.max_concurrent_uses = max(key.max_concurrent_uses, 1)
                 model.credential = key.credential
                 model.credential_fingerprint = credential_fingerprint(key.credential)
                 model.status = key.status.value
@@ -173,6 +198,41 @@ class SqlAlchemyKeyRepository(KeyRepository):
                 update(ApiKeyModel)
                 .where(ApiKeyModel.id == key_id)
                 .values(status=status, cooldown_until=cooldown_until, updated_at=now)
+            )
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.commit()
+                return None
+            await session.commit()
+        return await self.get_key(key_id)
+
+    async def update_pool(self, key_id: str, pool: KeyPool) -> ApiKey | None:
+        now = utcnow()
+        async with self._write_factory() as session:
+            stmt = (
+                update(ApiKeyModel)
+                .where(ApiKeyModel.id == key_id)
+                .values(pool=pool.value, updated_at=now)
+            )
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.commit()
+                return None
+            await session.commit()
+        return await self.get_key(key_id)
+
+    async def update_max_concurrent_uses(
+        self, key_id: str, max_concurrent_uses: int
+    ) -> ApiKey | None:
+        now = utcnow()
+        async with self._write_factory() as session:
+            stmt = (
+                update(ApiKeyModel)
+                .where(ApiKeyModel.id == key_id)
+                .values(
+                    max_concurrent_uses=max(max_concurrent_uses, 1),
+                    updated_at=now,
+                )
             )
             result = await session.execute(stmt)
             if result.rowcount == 0:
@@ -361,6 +421,8 @@ class SqlAlchemyKeyRepository(KeyRepository):
             id=model.id,
             provider=model.provider,
             credential=model.credential,
+            pool=KeyPool(model.pool or KeyPool.DEFAULT.value),
+            max_concurrent_uses=max(model.max_concurrent_uses or 1, 1),
             status=KeyStatus(model.status),
             quota_used=model.quota_used,
             last_used_at=_as_utc(model.last_used_at),
