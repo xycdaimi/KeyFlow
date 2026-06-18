@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-04-29
+@Date: 2026-06-17
 @Description: Provider 插件契约与行为测试
 """
 from datetime import datetime, timedelta, timezone
@@ -12,6 +12,7 @@ import pytest
 from infrastructure.config.settings import Settings
 from infrastructure.plugins.providers.gemini_web_proxy import GeminiWebProxyPlugin, _KNOWN_MODELS
 from infrastructure.plugins.providers.gemini import GeminiPlugin
+from infrastructure.plugins.providers.gemini_custom import GeminiPlugin as GeminiCustomPlugin
 from infrastructure.plugins.providers.gemini_oauth import GeminiOauthPlugin
 from infrastructure.plugins.base import CapacitySignal
 from infrastructure.plugins.providers.anthropic import AnthropicPlugin
@@ -20,6 +21,10 @@ from infrastructure.plugins.providers.codex_oauth import CodexOauthPlugin, _CODE
 from infrastructure.plugins.providers.codex_openai import CodexOpenAiPlugin
 from infrastructure.plugins.providers.openai import OpenAIPlugin
 from infrastructure.plugins.providers.openrouter import OpenRouterPlugin
+from infrastructure.plugins.providers.qwen_image_edit import (
+    QwenImageEditPlugin,
+    _KNOWN_MODELS as _QWEN_IMAGE_EDIT_KNOWN_MODELS,
+)
 from tests.fakes import FakeProviderPlugin
 
 
@@ -222,6 +227,67 @@ async def test_gemini_web_proxy_explain_includes_dependency_strategy() -> None:
 
 
 @pytest.mark.anyio
+async def test_qwen_image_edit_fetch_models_returns_static_models_by_default() -> None:
+    plugin = QwenImageEditPlugin()
+
+    models = await plugin.fetch_models({"api_key": "sk-test"})
+
+    assert models == list(_QWEN_IMAGE_EDIT_KNOWN_MODELS)
+
+
+@pytest.mark.anyio
+async def test_qwen_image_edit_availability_calls_dashscope_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Response:
+        status_code = 200
+
+    class _FakeMultiModalConversation:
+        @staticmethod
+        def call(**kwargs):
+            assert kwargs["api_key"] == "sk-test"
+            assert kwargs["model"] == "qwen-image-edit"
+            assert kwargs["messages"][0]["content"][0]["image"].startswith("data:image/png;base64,")
+            return _Response()
+
+    monkeypatch.setattr("infrastructure.plugins.providers.qwen_image_edit.dashscope", object())
+    monkeypatch.setattr(
+        "infrastructure.plugins.providers.qwen_image_edit.MultiModalConversation",
+        _FakeMultiModalConversation,
+    )
+
+    plugin = QwenImageEditPlugin()
+
+    assert await plugin.is_credential_available({"api_key": "sk-test"}) is True
+
+
+@pytest.mark.anyio
+async def test_qwen_image_edit_endpoint_is_restored_after_sdk_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DashScope:
+        base_http_api_url = "https://dashscope.aliyuncs.com/api/v1"
+
+    class _Response:
+        status_code = 200
+
+    class _FakeMultiModalConversation:
+        @staticmethod
+        def call(**kwargs):
+            assert _DashScope.base_http_api_url == "https://dashscope-intl.aliyuncs.com/api/v1"
+            return _Response()
+
+    monkeypatch.setattr("infrastructure.plugins.providers.qwen_image_edit.dashscope", _DashScope)
+    monkeypatch.setattr(
+        "infrastructure.plugins.providers.qwen_image_edit.MultiModalConversation",
+        _FakeMultiModalConversation,
+    )
+
+    plugin = QwenImageEditPlugin()
+
+    assert await plugin.is_credential_available(
+        {"api_key": "sk-test", "base_http_api_url": "https://dashscope-intl.aliyuncs.com/api/v1"}
+    )
+    assert _DashScope.base_http_api_url == "https://dashscope.aliyuncs.com/api/v1"
+
+
+@pytest.mark.anyio
 async def test_gemini_web_proxy_requires_both_cookie_fields() -> None:
     plugin = GeminiWebProxyPlugin()
 
@@ -381,6 +447,85 @@ async def test_gemini_vertex_ai_availability_generates_with_sdk_client(
     assert "location" not in captured
     assert fake_models.generated_models == ["gemini-2.5-flash"]
     assert captured["contents"] == "ping"
+
+
+@pytest.mark.anyio
+async def test_gemini_prepare_credential_accepts_boolean_vertexai_true() -> None:
+    plugin = GeminiPlugin()
+
+    result = await plugin.prepare_credential(
+        {
+            "api_key": "AQ.A-test",
+            "vertexai": True,
+        }
+    )
+
+    assert result.credential["vertexai"] is True
+    assert result.changed is False
+
+
+@pytest.mark.anyio
+async def test_gemini_prepare_credential_normalizes_string_vertexai_true() -> None:
+    plugin = GeminiPlugin()
+
+    result = await plugin.prepare_credential(
+        {
+            "api_key": "AQ.A-test",
+            "vertexai": "true",
+        }
+    )
+
+    assert result.credential["vertexai"] is True
+    assert result.changed is True
+
+
+def test_gemini_custom_build_client_uses_credential_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeHttpOptions:
+        def __init__(self, **kwargs) -> None:
+            captured["http_options_kwargs"] = kwargs
+
+    class _FakeClient:
+        def __init__(self, **kwargs) -> None:
+            captured["client_kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "infrastructure.plugins.providers.gemini_custom.get_settings",
+        lambda: Settings(_env_file=None, HTTP_TOTAL_TIMEOUT=12.0),
+    )
+    monkeypatch.setattr("infrastructure.plugins.providers.gemini_custom.types.HttpOptions", _FakeHttpOptions)
+    monkeypatch.setattr("infrastructure.plugins.providers.gemini_custom.genai.Client", _FakeClient)
+
+    plugin = GeminiCustomPlugin()
+    plugin._build_genai_client(
+        {
+            "api_key": "AIza-test",
+            "base_url": "https://custom-gemini.example.com",
+            "endpoint": "https://legacy-endpoint.example.com",
+        }
+    )
+
+    http_options = captured["http_options_kwargs"]
+    assert http_options["baseUrl"] == "https://custom-gemini.example.com"
+    assert http_options["timeout"] == 12000
+    assert captured["client_kwargs"]["api_key"] == "AIza-test"
+
+
+def test_gemini_custom_base_url_falls_back_to_legacy_endpoint() -> None:
+    plugin = GeminiCustomPlugin()
+
+    assert (
+        plugin._base_url(
+            {
+                "api_key": "AIza-test",
+                "endpoint": "https://legacy-endpoint.example.com",
+            }
+        )
+        == "https://legacy-endpoint.example.com"
+    )
 
 
 @pytest.mark.anyio

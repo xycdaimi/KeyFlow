@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-19
+@Date: 2026-06-08
 @Description: 应用运行时配置
 """
 from functools import lru_cache
@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     """Cache validity. Keys with last_refreshed_at within this window use cached availability."""
     background_task_interval_seconds: int = Field(default=60, alias="BACKGROUND_TASK_INTERVAL_SECONDS")
     """Interval for recover_cooldowns and refresh_keys background task."""
+    report_transient_failure_threshold: int = Field(
+        default=5,
+        alias="REPORT_TRANSIENT_FAILURE_THRESHOLD",
+    )
+    report_cooldown_disable_rounds: int = Field(
+        default=3,
+        alias="REPORT_COOLDOWN_DISABLE_ROUNDS",
+    )
+    report_backoff_minutes: str = Field(default="1,2,5,10", alias="REPORT_BACKOFF_MINUTES")
     global_http_proxy: str | None = Field(default=None, alias="GLOBAL_HTTP_PROXY")
     """Fixed HTTP proxy used by provider plugins whose egress mode is proxy."""
     http_connect_timeout: float = Field(default=3.0, alias="HTTP_CONNECT_TIMEOUT")

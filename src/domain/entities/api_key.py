@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: API Key 领域实体
 """
 from __future__ import annotations
@@ -44,6 +44,14 @@ class ApiKey:
     last_used_at: datetime | None = None
     success_count: int = 0
     error_count: int = 0
+    consecutive_error_count: int = 0
+    """Consecutive report-error count since the last report success cleanup."""
+    cooldown_failure_rounds: int = 0
+    """Number of transient-failure cooldown rounds accumulated from reports."""
+    rate_limit_rounds: int = 0
+    """Number of report-driven rate-limit rounds used for backoff."""
+    last_report_error_type: str | None = None
+    """Last normalized report error type for this key."""
     cooldown_until: datetime | None = None
     supported_models: list = field(default_factory=list)
     last_refreshed_at: datetime | None = None

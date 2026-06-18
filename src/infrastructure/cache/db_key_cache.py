@@ -1,19 +1,19 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-05
 @Description: SQL 数据库 Key 原子分配租约
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
-from sqlalchemy import delete, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from domain.entities.api_key import ApiKey
-from domain.repositories.key_repository import KeyAllocationStore
+from domain.repositories.key_repository import AllocationLease, KeyAllocationStore
 from domain.value_objects.key_pool import KeyPool
 from domain.value_objects.key_status import KeyStatus
 from infrastructure.db.models import ApiKeyModel, KeyLeaseModel
@@ -33,7 +33,14 @@ class DatabaseKeyCache(KeyAllocationStore):
         return None
 
     async def remove_key(self, key_id: str, provider: str, pool: KeyPool) -> None:
-        await self.release_key_lease(provider, pool, key_id)
+        async with self._write_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    delete(KeyLeaseModel)
+                    .where(KeyLeaseModel.provider == provider)
+                    .where(KeyLeaseModel.pool == pool.value)
+                    .where(KeyLeaseModel.key_id == key_id)
+                )
 
     async def allocate_key(
         self,
@@ -43,7 +50,8 @@ class DatabaseKeyCache(KeyAllocationStore):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         if not ordered_key_ids:
             return None
 
@@ -78,18 +86,22 @@ class DatabaseKeyCache(KeyAllocationStore):
                     if not self._is_usable(key["status"], key["cooldown_until"], now):
                         continue
 
-                    lease = await session.get(KeyLeaseModel, key_id, with_for_update=True)
-                    active_count = 0 if lease is None else lease.active_count
-                    if lease is not None and _utc(lease.lease_until) <= now:
-                        await session.delete(lease)
-                        await session.flush()
-                        lease = None
-                        active_count = 0
+                    active_count = (
+                        await session.execute(
+                            select(func.count())
+                            .select_from(KeyLeaseModel)
+                            .where(KeyLeaseModel.provider == provider)
+                            .where(KeyLeaseModel.pool == pool.value)
+                            .where(KeyLeaseModel.key_id == key_id)
+                            .where(KeyLeaseModel.lease_until > now)
+                        )
+                    ).scalar_one()
                     if active_count >= max(key["max_concurrent_uses"] or 1, 1):
                         continue
 
-                    await self._upsert_lease(session, provider, pool, key_id, expires_at, now, lease)
-                    return key_id
+                    allocated_lease_id = lease_id or uuid4().hex
+                    await self._insert_lease(session, provider, pool, key_id, allocated_lease_id, expires_at, now)
+                    return AllocationLease(key_id=key_id, lease_id=allocated_lease_id)
 
         return None
 
@@ -100,44 +112,46 @@ class DatabaseKeyCache(KeyAllocationStore):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         for key in ordered_keys:
-            allocated_id = await self.allocate_key(
+            lease = await self.allocate_key(
                 key.provider,
                 pool,
                 [key.id],
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=False,
+                lease_id=lease_id,
             )
-            if allocated_id is not None:
-                return allocated_id
+            if lease is not None:
+                return lease
         if not allow_leased_fallback:
             return None
         for key in ordered_keys:
-            allocated_id = await self.allocate_key(
+            lease = await self.allocate_key(
                 key.provider,
                 pool,
                 [key.id],
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=True,
+                lease_id=lease_id,
             )
-            if allocated_id is not None:
-                return allocated_id
+            if lease is not None:
+                return lease
         return None
 
-    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str) -> None:
+    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str, lease_id: str) -> None:
         async with self._write_factory() as session:
             async with session.begin():
-                lease = await session.get(KeyLeaseModel, key_id, with_for_update=True)
-                if lease is None or lease.provider != provider or lease.pool != pool.value:
-                    return
-                if lease.active_count <= 1:
-                    await session.delete(lease)
-                    return
-                lease.active_count -= 1
-                lease.updated_at = datetime.now(timezone.utc)
+                await session.execute(
+                    delete(KeyLeaseModel)
+                    .where(KeyLeaseModel.lease_id == lease_id)
+                    .where(KeyLeaseModel.provider == provider)
+                    .where(KeyLeaseModel.pool == pool.value)
+                    .where(KeyLeaseModel.key_id == key_id)
+                )
 
     @staticmethod
     def _is_usable(status: str, cooldown_until: datetime | None, now: datetime) -> bool:
@@ -150,35 +164,24 @@ class DatabaseKeyCache(KeyAllocationStore):
         return _utc(cooldown_until) <= now
 
     @staticmethod
-    async def _upsert_lease(
+    async def _insert_lease(
         session: AsyncSession,
         provider: str,
         pool: KeyPool,
         key_id: str,
+        lease_id: str,
         expires_at: datetime,
         now: datetime,
-        existing_lease: KeyLeaseModel | None,
     ) -> None:
-        if existing_lease is None:
-            session.add(
-                KeyLeaseModel(
-                    key_id=key_id,
-                    provider=provider,
-                    pool=pool.value,
-                    lease_until=expires_at,
-                    active_count=1,
-                    created_at=now,
-                    updated_at=now,
-                )
+        session.add(
+            KeyLeaseModel(
+                lease_id=lease_id,
+                key_id=key_id,
+                provider=provider,
+                pool=pool.value,
+                lease_until=expires_at,
+                created_at=now,
+                updated_at=now,
             )
-            try:
-                await session.flush()
-            except IntegrityError:
-                raise
-            return
-        existing_lease.provider = provider
-        existing_lease.pool = pool.value
-        existing_lease.lease_until = expires_at
-        existing_lease.active_count = (existing_lease.active_count or 0) + 1
-        existing_lease.updated_at = now
+        )
         await session.flush()

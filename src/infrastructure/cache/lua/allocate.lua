@@ -1,7 +1,17 @@
 local now_ts = tonumber(ARGV[1])
 local lease_seconds = tonumber(ARGV[2])
+local provider = ARGV[3]
+local pool = ARGV[4]
+local lease_id = ARGV[5]
 local provider_zset = KEYS[1]
-local lease_zset = KEYS[2]
+
+local function lease_hash(lease_id_value)
+  return "keyflow:lease:" .. lease_id_value
+end
+
+local function key_lease_zset(key_id)
+  return "keyflow:key:" .. key_id .. ":leases"
+end
 
 local function is_usable(key_id)
   local hash_key = "keyflow:key:" .. key_id
@@ -17,27 +27,20 @@ local function is_usable(key_id)
   return usable
 end
 
-local function mark_allocated(key_id)
-  local expires_at = now_ts + lease_seconds
-  local hash_key = "keyflow:key:" .. key_id
-  local active_count = tonumber(redis.call("HGET", hash_key, "active_lease_count") or "0") or 0
-  redis.call("ZADD", lease_zset, expires_at, key_id)
-  redis.call("HSET", hash_key, "active_lease_count", tostring(active_count + 1))
-  redis.call("HSET", hash_key, "status", "available")
-  redis.call("HSET", hash_key, "cooldown_until", "")
-  redis.call("HSET", hash_key, "last_used_at", tostring(now_ts))
-  return key_id
+local function prune_expired(key_id)
+  local zset_key = key_lease_zset(key_id)
+  local expired = redis.call("ZRANGEBYSCORE", zset_key, "-inf", now_ts)
+  for _, expired_lease_id in ipairs(expired) do
+    redis.call("DEL", lease_hash(expired_lease_id))
+  end
+  if #expired > 0 then
+    redis.call("ZREMRANGEBYSCORE", zset_key, "-inf", now_ts)
+  end
 end
 
 local function active_count_for(key_id)
-  local hash_key = "keyflow:key:" .. key_id
-  local lease_until = redis.call("ZSCORE", lease_zset, key_id)
-  if lease_until and tonumber(lease_until) <= now_ts then
-    redis.call("ZREM", lease_zset, key_id)
-    redis.call("HSET", hash_key, "active_lease_count", "0")
-    return 0
-  end
-  return tonumber(redis.call("HGET", hash_key, "active_lease_count") or "0") or 0
+  prune_expired(key_id)
+  return redis.call("ZCARD", key_lease_zset(key_id))
 end
 
 local function max_concurrent_for(key_id)
@@ -49,7 +52,29 @@ local function max_concurrent_for(key_id)
   return value
 end
 
-for i = 4, #ARGV do
+local function mark_allocated(key_id)
+  local expires_at = now_ts + lease_seconds
+  local key_hash = "keyflow:key:" .. key_id
+  redis.call("ZADD", key_lease_zset(key_id), expires_at, lease_id)
+  redis.call(
+    "HSET",
+    lease_hash(lease_id),
+    "key_id",
+    key_id,
+    "provider",
+    provider,
+    "pool",
+    pool,
+    "lease_until",
+    tostring(expires_at)
+  )
+  redis.call("HSET", key_hash, "status", "available")
+  redis.call("HSET", key_hash, "cooldown_until", "")
+  redis.call("HSET", key_hash, "last_used_at", tostring(now_ts))
+  return key_id
+end
+
+for i = 6, #ARGV do
   local key_id = ARGV[i]
   if redis.call("ZSCORE", provider_zset, key_id) then
     if is_usable(key_id) and active_count_for(key_id) < max_concurrent_for(key_id) then

@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: SQLAlchemy Key 仓储实现
 """
 from __future__ import annotations
@@ -129,6 +129,10 @@ class SqlAlchemyKeyRepository(KeyRepository):
                 model.quota_used = key.quota_used
                 model.success_count = key.success_count
                 model.error_count = key.error_count
+                model.consecutive_error_count = key.consecutive_error_count
+                model.cooldown_failure_rounds = key.cooldown_failure_rounds
+                model.rate_limit_rounds = key.rate_limit_rounds
+                model.last_report_error_type = key.last_report_error_type
                 model.last_used_at = key.last_used_at
                 model.cooldown_until = key.cooldown_until
                 model.supported_models = key.supported_models
@@ -185,6 +189,52 @@ class SqlAlchemyKeyRepository(KeyRepository):
             model.updated_at = now
             await session.commit()
         return await self.get_key(key_id)
+
+    async def record_error_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+        async with self._write_factory() as session:
+            stmt = (
+                update(ApiKeyModel)
+                .where(ApiKeyModel.id == key.id)
+                .values(
+                    error_count=key.error_count,
+                    last_used_at=key.last_used_at,
+                    status=key.status.value,
+                    cooldown_until=key.cooldown_until,
+                    consecutive_error_count=key.consecutive_error_count,
+                    cooldown_failure_rounds=key.cooldown_failure_rounds,
+                    rate_limit_rounds=key.rate_limit_rounds,
+                    last_report_error_type=key.last_report_error_type,
+                    updated_at=now,
+                )
+            )
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.commit()
+                return None
+            await session.commit()
+        return await self.get_key(key.id)
+
+    async def record_success_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+        async with self._write_factory() as session:
+            stmt = (
+                update(ApiKeyModel)
+                .where(ApiKeyModel.id == key.id)
+                .values(
+                    success_count=key.success_count,
+                    quota_used=key.quota_used,
+                    last_used_at=key.last_used_at,
+                    consecutive_error_count=key.consecutive_error_count,
+                    cooldown_failure_rounds=key.cooldown_failure_rounds,
+                    rate_limit_rounds=key.rate_limit_rounds,
+                    updated_at=now,
+                )
+            )
+            result = await session.execute(stmt)
+            if result.rowcount == 0:
+                await session.commit()
+                return None
+            await session.commit()
+        return await self.get_key(key.id)
 
     async def update_status(
         self,
@@ -318,6 +368,10 @@ class SqlAlchemyKeyRepository(KeyRepository):
                     cached_available=key.cached_available,
                     cached_quota_available=key.cached_quota_available,
                     cached_capacity_score=key.cached_capacity_score,
+                    consecutive_error_count=key.consecutive_error_count,
+                    cooldown_failure_rounds=key.cooldown_failure_rounds,
+                    rate_limit_rounds=key.rate_limit_rounds,
+                    last_report_error_type=key.last_report_error_type,
                     updated_at=now,
                 )
                 result = await session.execute(stmt)
@@ -356,6 +410,52 @@ class SqlAlchemyKeyRepository(KeyRepository):
                                     KeyStatus.DISABLED_REPORT.value,
                                 ]
                             ),
+                        )
+                    )
+                    .values(
+                        credential=key.credential,
+                        credential_fingerprint=credential_fingerprint(key.credential),
+                        status=key.status.value,
+                        cooldown_until=key.cooldown_until,
+                        supported_models=key.supported_models,
+                        last_refreshed_at=key.last_refreshed_at,
+                        cached_available=key.cached_available,
+                        cached_quota_available=key.cached_quota_available,
+                        cached_capacity_score=key.cached_capacity_score,
+                        updated_at=now,
+                    )
+                )
+                result = await session.execute(stmt)
+                if result.rowcount == 0:
+                    await session.commit()
+                    return None
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                if self._is_provider_credential_unique_violation(exc):
+                    raise DuplicateCredentialError(
+                        f"credential already exists for provider {key.provider}"
+                    ) from exc
+                raise
+        return await self.get_key(key.id)
+
+    async def update_report_disabled_runtime_snapshot_if_locked(
+        self,
+        key: ApiKey,
+        owner: str,
+        now: datetime,
+    ) -> ApiKey | None:
+        async with self._write_factory() as session:
+            try:
+                stmt = (
+                    update(ApiKeyModel)
+                    .where(ApiKeyModel.id == key.id)
+                    .where(
+                        and_(
+                            ApiKeyModel.runtime_lock_owner == owner,
+                            ApiKeyModel.runtime_lock_until.is_not(None),
+                            ApiKeyModel.runtime_lock_until > now,
+                            ApiKeyModel.status == KeyStatus.DISABLED_REPORT.value,
                         )
                     )
                     .values(
@@ -428,6 +528,10 @@ class SqlAlchemyKeyRepository(KeyRepository):
             last_used_at=_as_utc(model.last_used_at),
             success_count=model.success_count,
             error_count=model.error_count,
+            consecutive_error_count=model.consecutive_error_count or 0,
+            cooldown_failure_rounds=model.cooldown_failure_rounds or 0,
+            rate_limit_rounds=model.rate_limit_rounds or 0,
+            last_report_error_type=model.last_report_error_type,
             cooldown_until=_as_utc(model.cooldown_until),
             supported_models=model.supported_models or [],
             last_refreshed_at=_as_utc(model.last_refreshed_at),

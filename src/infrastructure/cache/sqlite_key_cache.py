@@ -1,17 +1,18 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-05
 @Description: SQLite 本地运行模式 Key 分配租约
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, func, select, text
 
 from domain.entities.api_key import ApiKey
-from domain.repositories.key_repository import KeyAllocationStore
+from domain.repositories.key_repository import AllocationLease, KeyAllocationStore
 from domain.value_objects.key_pool import KeyPool
 from domain.value_objects.key_status import KeyStatus
 from infrastructure.db.models import ApiKeyModel, KeyLeaseModel
@@ -31,7 +32,13 @@ class SqliteKeyCache(KeyAllocationStore):
         return None
 
     async def remove_key(self, key_id: str, provider: str, pool: KeyPool) -> None:
-        await self.release_key_lease(provider, pool, key_id)
+        async with self._write_engine.begin() as conn:
+            await conn.execute(
+                delete(KeyLeaseModel)
+                .where(KeyLeaseModel.provider == provider)
+                .where(KeyLeaseModel.pool == pool.value)
+                .where(KeyLeaseModel.key_id == key_id)
+            )
 
     async def allocate_key(
         self,
@@ -41,7 +48,8 @@ class SqliteKeyCache(KeyAllocationStore):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         if not ordered_key_ids:
             return None
 
@@ -74,44 +82,32 @@ class SqliteKeyCache(KeyAllocationStore):
                     if not self._is_usable(key["status"], key["cooldown_until"], now):
                         continue
 
-                    lease = (
-                        await conn.execute(
-                            select(KeyLeaseModel.lease_until, KeyLeaseModel.active_count)
-                        .where(KeyLeaseModel.provider == provider)
-                        .where(KeyLeaseModel.pool == pool.value)
-                        .where(KeyLeaseModel.key_id == key_id)
-                        )
-                    ).mappings().first()
-                    active_count = 0
-                    lease_until = None
-                    if lease is not None:
-                        lease_until = lease["lease_until"]
-                        active_count = lease["active_count"] or 0
                     max_concurrent_uses = max(key["max_concurrent_uses"] or 1, 1)
-                    if lease_until is not None and _utc(lease_until) <= now:
+                    active_count = (
                         await conn.execute(
-                            delete(KeyLeaseModel)
+                            select(func.count())
+                            .select_from(KeyLeaseModel)
                             .where(KeyLeaseModel.provider == provider)
                             .where(KeyLeaseModel.pool == pool.value)
                             .where(KeyLeaseModel.key_id == key_id)
+                            .where(KeyLeaseModel.lease_until > now)
                         )
-                        lease_until = None
-                        active_count = 0
+                    ).scalar_one()
                     if active_count >= max_concurrent_uses:
                         continue
 
-                    await self._upsert_lease(
+                    allocated_lease_id = lease_id or uuid4().hex
+                    await self._insert_lease(
                         conn,
                         provider,
                         pool,
                         key_id,
+                        allocated_lease_id,
                         expires_at,
                         now,
-                        lease_until,
-                        active_count,
                     )
                     await conn.commit()
-                    return key_id
+                    return AllocationLease(key_id=key_id, lease_id=allocated_lease_id)
 
                 await conn.commit()
                 return None
@@ -126,57 +122,44 @@ class SqliteKeyCache(KeyAllocationStore):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         for key in ordered_keys:
-            allocated_id = await self.allocate_key(
+            lease = await self.allocate_key(
                 key.provider,
                 pool,
                 [key.id],
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=False,
+                lease_id=lease_id,
             )
-            if allocated_id is not None:
-                return allocated_id
+            if lease is not None:
+                return lease
         if not allow_leased_fallback:
             return None
         for key in ordered_keys:
-            allocated_id = await self.allocate_key(
+            lease = await self.allocate_key(
                 key.provider,
                 pool,
                 [key.id],
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=True,
+                lease_id=lease_id,
             )
-            if allocated_id is not None:
-                return allocated_id
+            if lease is not None:
+                return lease
         return None
 
-    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str) -> None:
+    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str, lease_id: str) -> None:
         async with self._write_engine.begin() as conn:
-            lease = (
-                await conn.execute(
-                    select(KeyLeaseModel.active_count)
-                    .where(KeyLeaseModel.provider == provider)
-                    .where(KeyLeaseModel.pool == pool.value)
-                    .where(KeyLeaseModel.key_id == key_id)
-                )
-            ).mappings().first()
-            if lease is None or (lease["active_count"] or 0) <= 1:
-                await conn.execute(
-                    delete(KeyLeaseModel)
-                    .where(KeyLeaseModel.provider == provider)
-                    .where(KeyLeaseModel.pool == pool.value)
-                    .where(KeyLeaseModel.key_id == key_id)
-                )
-                return
             await conn.execute(
-                update(KeyLeaseModel)
+                delete(KeyLeaseModel)
+                .where(KeyLeaseModel.lease_id == lease_id)
                 .where(KeyLeaseModel.provider == provider)
                 .where(KeyLeaseModel.pool == pool.value)
                 .where(KeyLeaseModel.key_id == key_id)
-                .values(active_count=(lease["active_count"] or 0) - 1)
             )
 
     @staticmethod
@@ -190,39 +173,23 @@ class SqliteKeyCache(KeyAllocationStore):
         return _utc(cooldown_until) <= now
 
     @staticmethod
-    async def _upsert_lease(
+    async def _insert_lease(
         conn,
         provider: str,
         pool: KeyPool,
         key_id: str,
+        lease_id: str,
         expires_at: datetime,
         now: datetime,
-        existing_lease_until: datetime | None,
-        active_count: int,
     ) -> None:
-        if existing_lease_until is None:
-            await conn.execute(
-                KeyLeaseModel.__table__.insert().values(
-                    key_id=key_id,
-                    provider=provider,
-                    pool=pool.value,
-                    lease_until=expires_at,
-                    active_count=1,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-            return
         await conn.execute(
-            update(KeyLeaseModel)
-            .where(KeyLeaseModel.provider == provider)
-            .where(KeyLeaseModel.pool == pool.value)
-            .where(KeyLeaseModel.key_id == key_id)
-            .values(
+            KeyLeaseModel.__table__.insert().values(
+                lease_id=lease_id,
+                key_id=key_id,
                 provider=provider,
                 pool=pool.value,
                 lease_until=expires_at,
-                active_count=active_count + 1,
+                created_at=now,
                 updated_at=now,
             )
         )

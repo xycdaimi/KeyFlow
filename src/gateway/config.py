@@ -23,6 +23,7 @@ class GatewaySettings(BaseSettings):
     internal_key: str = Field(default="dev-gateway-internal-key", alias="GATEWAY_INTERNAL_KEY")
     register_key: str = Field(default="dev-gateway-register-key", alias="GATEWAY_REGISTER_KEY")
     heartbeat_timeout_seconds: int = Field(default=90, alias="GATEWAY_HEARTBEAT_TIMEOUT_SECONDS")
+    stale_node_retention_seconds: int = Field(default=86400, alias="GATEWAY_STALE_NODE_RETENTION_SECONDS")
     node_http_connect_timeout_seconds: float = Field(default=1.0, alias="GATEWAY_NODE_HTTP_CONNECT_TIMEOUT_SECONDS")
     node_http_read_timeout_seconds: float = Field(default=5.0, alias="GATEWAY_NODE_HTTP_READ_TIMEOUT_SECONDS")
     node_probe_cache_seconds: int = Field(default=15, alias="GATEWAY_NODE_PROBE_CACHE_SECONDS")

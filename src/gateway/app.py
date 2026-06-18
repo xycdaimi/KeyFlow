@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,14 @@ def _node_status(node: GatewayNode, settings: GatewaySettings) -> str:
         return "unknown"
     age = (_utc_now() - node.last_heartbeat_at).total_seconds()
     return "online" if age <= settings.heartbeat_timeout_seconds else "stale"
+
+
+async def _prune_stale_nodes(repo: SQLiteGatewayNodeRepository, settings: GatewaySettings) -> None:
+    if settings.stale_node_retention_seconds <= 0:
+        return
+    cutoff_seconds = settings.heartbeat_timeout_seconds + settings.stale_node_retention_seconds
+    cutoff = _utc_now() - timedelta(seconds=cutoff_seconds)
+    await repo.prune_stale_nodes(cutoff)
 
 
 def _to_node_response(node: GatewayNode, settings: GatewaySettings) -> GatewayNodeResponse:
@@ -122,6 +130,7 @@ def create_gateway_app(
 
     @router.get("/nodes", response_model=list[GatewayNodeResponse])
     async def list_nodes(_: None = Depends(require_internal_key)):
+        await _prune_stale_nodes(repo, app_settings)
         nodes = await repo.list_nodes()
         return [_to_node_response(node, app_settings) for node in nodes]
 
@@ -144,6 +153,7 @@ def create_gateway_app(
 
     @router.get("/capabilities", response_model=CapabilitiesResponse)
     async def capabilities(_: None = Depends(require_internal_key)):
+        await _prune_stale_nodes(repo, app_settings)
         return await gateway_service.get_capabilities()
 
     async def forward_to_node(node_id: str, method: str, path: str, body: Any | None):

@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-06-08
+@Date: 2026-06-17
 @Description: Google Gemini official API provider plugin
 """
 from __future__ import annotations
@@ -33,13 +33,13 @@ _VERTEXAI_MODELS: tuple[str, ...] = (
 _VERTEXAI_PROBE_MODEL = "gemini-2.5-flash"
 
 
-class GeminiPlugin(ProviderPlugin):
+class GeminiCustomPlugin(ProviderPlugin):
     PLUGIN_VERSION = "1.0.0"
     PLUGIN_INTERFACE_VERSION = "1.0.0"
 
     @property
     def name(self) -> str:
-        return "gemini"
+        return "gemini_custom"
 
     @property
     def description(self) -> str:
@@ -52,8 +52,9 @@ class GeminiPlugin(ProviderPlugin):
     @property
     def credential_hint(self) -> str:
         return (
-            '{"api_key": "AIza..."} (Google AI Studio API Key) or '
-            '{"api_key": "AQ.A...", "vertexai": true} '
+            '{"api_key": "AIza...", "base_url": "https://example.com"} '
+            "(Google AI Studio API Key) or "
+            '{"api_key": "AQ.A...", "vertexai": true, "base_url": "https://example.com"} '
             "(Vertex AI API Key)"
         )
 
@@ -75,6 +76,10 @@ class GeminiPlugin(ProviderPlugin):
         return str(credential.get("vertexai", "")).strip().lower() in _VERTEXAI_TRUE_VALUES
 
     @staticmethod
+    def _base_url(credential: dict[str, Any]) -> str:
+        return str(credential.get("base_url") or credential.get("endpoint") or _BASE_URL).strip()
+
+    @staticmethod
     def _normalize_sdk_model_name(model: str) -> str:
         marker = "/publishers/google/models/"
         if marker in model:
@@ -90,10 +95,10 @@ class GeminiPlugin(ProviderPlugin):
     def _build_genai_client(self, credential: dict[str, Any]):
         api_key = self._api_key(credential)
         vertexai = self._is_vertexai(credential)
-        endpoint = str(credential.get("endpoint", "")).strip()
+        base_url = self._base_url(credential)
 
         client_kwargs = {"api_key": api_key}
-        http_options = self._build_genai_http_options(endpoint)
+        http_options = self._build_genai_http_options(base_url)
         if http_options is not None:
             client_kwargs["http_options"] = http_options
         if vertexai:
@@ -219,9 +224,11 @@ class GeminiPlugin(ProviderPlugin):
                 {
                     "auth_type": "vertex_api_key",
                     "vertexai": True,
+                    "base_url": self._base_url(credential),
                 }
             )
             return info
 
         info["auth_type"] = "x-goog-api-key"
+        info["base_url"] = self._base_url(credential)
         return info

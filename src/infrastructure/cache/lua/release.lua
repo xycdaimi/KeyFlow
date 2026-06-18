@@ -1,14 +1,17 @@
-local lease_zset = KEYS[1]
-local key_id = ARGV[1]
-local hash_key = "keyflow:key:" .. key_id
-local active_count = tonumber(redis.call("HGET", hash_key, "active_lease_count") or "0") or 0
+local provider = ARGV[1]
+local pool = ARGV[2]
+local key_id = ARGV[3]
+local lease_id = ARGV[4]
 
-if active_count <= 1 then
-  redis.call("HSET", hash_key, "active_lease_count", "0")
-  redis.call("ZREM", lease_zset, key_id)
+local lease_hash = "keyflow:lease:" .. lease_id
+local stored_key_id = redis.call("HGET", lease_hash, "key_id")
+local stored_provider = redis.call("HGET", lease_hash, "provider")
+local stored_pool = redis.call("HGET", lease_hash, "pool")
+
+if stored_key_id ~= key_id or stored_provider ~= provider or stored_pool ~= pool then
   return 0
 end
 
-active_count = active_count - 1
-redis.call("HSET", hash_key, "active_lease_count", tostring(active_count))
-return active_count
+redis.call("DEL", lease_hash)
+redis.call("ZREM", "keyflow:key:" .. key_id .. ":leases", lease_id)
+return 1

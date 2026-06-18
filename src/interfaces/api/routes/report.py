@@ -42,7 +42,7 @@ async def report_error(
 ) -> KeyResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
-        key = await service.report_error(payload.key_id, payload.error_type)
+        key = await service.report_error(payload.key_id, payload.lease_id, payload.error_type)
     except KeyNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key_not_found") from exc
     return _key_response(key)
@@ -57,7 +57,7 @@ async def report_success(
 ) -> KeyResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
-        key = await service.report_success(payload.key_id, payload.tokens_used)
+        key = await service.report_success(payload.key_id, payload.lease_id, payload.tokens_used)
     except KeyNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="key_not_found") from exc
     return _key_response(key)

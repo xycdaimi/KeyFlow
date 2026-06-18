@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: PostgreSQL 写库启动引导
 """
 from __future__ import annotations
@@ -63,6 +63,8 @@ async def ensure_schema_ready(write_engine) -> None:
         try:
             async with write_engine.begin() as connection:
                 await connection.run_sync(Base.metadata.create_all)
+                if await ensure_task_lease_table(connection):
+                    await connection.run_sync(Base.metadata.create_all)
             return
         except Exception:
             if attempt >= DB_SCHEMA_INIT_MAX_ATTEMPTS:
@@ -83,19 +85,30 @@ async def ensure_refresh_columns(conn) -> None:
         ("credential_fingerprint", "VARCHAR(64)"),
         ("pool", "VARCHAR(32) DEFAULT 'default'"),
         ("max_concurrent_uses", "INTEGER DEFAULT 1"),
+        ("consecutive_error_count", "INTEGER DEFAULT 0"),
+        ("cooldown_failure_rounds", "INTEGER DEFAULT 0"),
+        ("rate_limit_rounds", "INTEGER DEFAULT 0"),
+        ("last_report_error_type", "VARCHAR(64)"),
     ]:
         await conn.execute(
             text(f"ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS {col} {sql_type}")
         )
 
 
-async def ensure_lease_columns(conn) -> None:
-    for col, sql_type in [
-        ("active_count", "INTEGER DEFAULT 1"),
-    ]:
-        await conn.execute(
-            text(f"ALTER TABLE key_leases ADD COLUMN IF NOT EXISTS {col} {sql_type}")
+async def ensure_task_lease_table(conn) -> bool:
+    if not hasattr(conn, "execute"):
+        return False
+    result = await conn.execute(
+        text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'key_leases'"
         )
+    )
+    columns = {row[0] for row in result.fetchall()}
+    if columns and "lease_id" not in columns:
+        await conn.execute(text("DROP TABLE key_leases"))
+        return True
+    return False
 
 
 async def ensure_credential_uniqueness(conn) -> None:
@@ -132,8 +145,23 @@ async def backfill_concurrency_limits(conn) -> None:
     await conn.execute(
         text("UPDATE api_keys SET max_concurrent_uses = 1 WHERE max_concurrent_uses IS NULL")
     )
+
+
+async def backfill_report_state_columns(conn) -> None:
     await conn.execute(
-        text("UPDATE key_leases SET active_count = 1 WHERE active_count IS NULL")
+        text(
+            "UPDATE api_keys SET consecutive_error_count = 0 "
+            "WHERE consecutive_error_count IS NULL"
+        )
+    )
+    await conn.execute(
+        text(
+            "UPDATE api_keys SET cooldown_failure_rounds = 0 "
+            "WHERE cooldown_failure_rounds IS NULL"
+        )
+    )
+    await conn.execute(
+        text("UPDATE api_keys SET rate_limit_rounds = 0 WHERE rate_limit_rounds IS NULL")
     )
 
 
@@ -148,9 +176,10 @@ async def bootstrap_write_database(database_url: str, write_engine) -> None:
     await ensure_schema_ready(write_engine)
     async with write_engine.begin() as conn:
         await ensure_refresh_columns(conn)
-        await ensure_lease_columns(conn)
+        await ensure_task_lease_table(conn)
         await backfill_key_pools(conn)
         await backfill_concurrency_limits(conn)
+        await backfill_report_state_columns(conn)
         await backfill_credential_fingerprints(conn)
         await ensure_credential_fingerprint_not_null(conn)
         await ensure_credential_uniqueness(conn)

@@ -22,7 +22,12 @@ async def allocate_key(
 ) -> AllocateResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
-        allocation = await service.allocate_key(payload.provider, payload.model, pool=payload.pool)
+        allocation = await service.allocate_key(
+            payload.provider,
+            payload.model,
+            pool=payload.pool,
+            lease_seconds=payload.lease_seconds,
+        )
     except NoAvailableKeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -36,6 +41,7 @@ async def allocate_key(
 
     return AllocateResponse(
         key_id=allocation.key.id,
+        lease_id=allocation.lease_id,
         provider_model=allocation.provider_model,
         credential=allocation.key.credential,
     )
@@ -50,7 +56,11 @@ async def allocate_key_by_model(
 ) -> AllocateByModelResponse:
     await verify_internal_key(settings, x_internal_key)
     try:
-        allocation = await service.allocate_key_by_model(payload.model, pool=payload.pool)
+        allocation = await service.allocate_key_by_model(
+            payload.model,
+            pool=payload.pool,
+            lease_seconds=payload.lease_seconds,
+        )
     except NoAvailableKeyError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -64,6 +74,7 @@ async def allocate_key_by_model(
 
     return AllocateByModelResponse(
         key_id=allocation.key.id,
+        lease_id=allocation.lease_id,
         provider=allocation.key.provider,
         provider_model=allocation.provider_model or payload.model,
         credential=allocation.key.credential,

@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-05
 @Description: API 响应数据模型
 """
 from datetime import datetime
@@ -35,12 +35,14 @@ class KeyResponse(BaseModel):
 
 class AllocateResponse(BaseModel):
     key_id: str
+    lease_id: str
     provider_model: str | None
     credential: dict[str, Any]
 
 
 class AllocateByModelResponse(BaseModel):
     key_id: str
+    lease_id: str
     provider: str
     provider_model: str
     credential: dict[str, Any]

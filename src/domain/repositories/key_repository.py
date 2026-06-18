@@ -1,16 +1,33 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: Key 仓储协议定义
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
 from domain.entities.api_key import ApiKey
 from domain.value_objects.key_pool import KeyPool
+
+
+@dataclass(slots=True)
+class AllocationLease:
+    key_id: str
+    lease_id: str
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.key_id == other
+        if isinstance(other, AllocationLease):
+            return self.key_id == other.key_id and self.lease_id == other.lease_id
+        return False
+
+    def __hash__(self) -> int:
+        return hash(self.key_id)
 
 
 class KeyRepository(Protocol):
@@ -48,6 +65,14 @@ class KeyRepository(Protocol):
 
     async def record_error(self, key_id: str, now: datetime) -> ApiKey | None:
         """Increment error priority fields without changing runtime/admin state."""
+        ...
+
+    async def record_error_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+        """Persist report-error counters and state transition for one key."""
+        ...
+
+    async def record_success_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+        """Persist report-success counters and cleanup for one key."""
         ...
 
     async def update_status(
@@ -103,6 +128,15 @@ class KeyRepository(Protocol):
         """Persist background runtime refresh only if owner holds the lock and key is not admin/report disabled."""
         ...
 
+    async def update_report_disabled_runtime_snapshot_if_locked(
+        self,
+        key: ApiKey,
+        owner: str,
+        now: datetime,
+    ) -> ApiKey | None:
+        """Persist stale refresh recovery for a report-disabled key when the lock is held."""
+        ...
+
     async def delete_key(self, key_id: str) -> None:
         ...
 
@@ -131,7 +165,8 @@ class KeyAllocationStore(Protocol):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         ...
 
     async def allocate_key_any_provider(
@@ -141,8 +176,15 @@ class KeyAllocationStore(Protocol):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         ...
 
-    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str) -> None:
+    async def release_key_lease(
+        self,
+        provider: str,
+        pool: KeyPool,
+        key_id: str,
+        lease_id: str,
+    ) -> None:
         ...

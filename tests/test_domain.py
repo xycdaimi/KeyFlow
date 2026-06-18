@@ -1,12 +1,13 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: 领域服务与分配逻辑回归测试
 """
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -20,6 +21,7 @@ from domain.exceptions.domain_exceptions import (
     NoAvailableKeyError,
     ProviderNotFoundError,
     ProviderNotReadyError,
+    RuntimeLockUnavailableError,
     UpstreamUnreachableError,
 )
 from domain.services.scheduler import KeyScheduler
@@ -87,6 +89,94 @@ def test_state_machine_handles_generic_error_without_exhaustion_probe() -> None:
 
     assert key.status == KeyStatus.AVAILABLE
     assert key.error_count == 1
+
+
+def test_api_key_report_state_fields_default_to_zero() -> None:
+    key = ApiKey(
+        id="key-report-defaults",
+        provider="openai",
+        credential={"api_key": "sk-test"},
+    )
+
+    assert key.consecutive_error_count == 0
+    assert key.cooldown_failure_rounds == 0
+    assert key.rate_limit_rounds == 0
+    assert key.last_report_error_type is None
+
+
+def test_state_machine_report_error_rate_limit_sets_backoff() -> None:
+    now = datetime.now(timezone.utc)
+    key = ApiKey(id="key-rate-limit", provider="openai", credential={"api_key": "sk-test"})
+    machine = KeyStateMachine(
+        report_transient_failure_threshold=5,
+        report_cooldown_disable_rounds=3,
+        report_backoff_minutes=(1, 2, 5, 10),
+    )
+
+    machine.on_report_error(key, "rate_limit", now)
+
+    assert key.status == KeyStatus.RATE_LIMITED
+    assert key.cooldown_until == now + timedelta(minutes=1)
+    assert key.rate_limit_rounds == 1
+    assert key.last_report_error_type == "rate_limit"
+
+
+def test_state_machine_report_error_transient_enters_cooldown_after_threshold() -> None:
+    now = datetime.now(timezone.utc)
+    key = ApiKey(id="key-transient", provider="openai", credential={"api_key": "sk-test"})
+    machine = KeyStateMachine(
+        report_transient_failure_threshold=5,
+        report_cooldown_disable_rounds=3,
+        report_backoff_minutes=(1, 2, 5, 10),
+    )
+
+    for _ in range(5):
+        machine.on_report_error(key, "network_timeout", now)
+
+    assert key.status == KeyStatus.COOLDOWN
+    assert key.cooldown_until == now + timedelta(minutes=1)
+    assert key.consecutive_error_count == 0
+    assert key.cooldown_failure_rounds == 1
+
+
+def test_state_machine_report_error_three_cooldown_rounds_disable_report() -> None:
+    now = datetime.now(timezone.utc)
+    key = ApiKey(id="key-disabled-report", provider="openai", credential={"api_key": "sk-test"})
+    machine = KeyStateMachine(
+        report_transient_failure_threshold=5,
+        report_cooldown_disable_rounds=3,
+        report_backoff_minutes=(1, 2, 5, 10),
+    )
+
+    for _ in range(15):
+        machine.on_report_error(key, "execution_failed", now)
+
+    assert key.status == KeyStatus.DISABLED_REPORT
+    assert key.cooldown_until is None
+    assert key.cooldown_failure_rounds == 3
+
+
+def test_state_machine_report_success_clears_short_term_counters_only() -> None:
+    now = datetime.now(timezone.utc)
+    key = ApiKey(
+        id="key-success-cleanup",
+        provider="openai",
+        credential={"api_key": "sk-test"},
+        status=KeyStatus.DISABLED_REPORT,
+        consecutive_error_count=4,
+        cooldown_failure_rounds=2,
+        rate_limit_rounds=3,
+    )
+    machine = KeyStateMachine()
+
+    machine.on_report_success(key, tokens_used=12, now=now)
+
+    assert key.status == KeyStatus.DISABLED_REPORT
+    assert key.success_count == 1
+    assert key.quota_used == 12
+    assert key.consecutive_error_count == 0
+    assert key.rate_limit_rounds == 0
+    assert key.cooldown_failure_rounds == 2
 
 
 def test_scheduler_selects_highest_ranked_key() -> None:
@@ -1304,11 +1394,11 @@ async def test_recover_ready_keys_only_persists_keys_that_changed_status() -> No
     await service._recover_ready_keys(keys, now)
 
     assert repository.upserted_ids == []
-    assert repository.updated_status_ids == ["recoverable", "still-cooling"]
+    assert repository.updated_status_ids == ["recoverable"]
     assert repository._keys["already-available"].status == KeyStatus.AVAILABLE
     assert repository._keys["recoverable"].status == KeyStatus.AVAILABLE
     assert repository._keys["recoverable"].cooldown_until is None
-    assert repository._keys["still-cooling"].status == KeyStatus.COOLDOWN
+    assert repository._keys["still-cooling"].status == KeyStatus.RATE_LIMITED
 
 
 @pytest.mark.anyio
@@ -1427,14 +1517,17 @@ async def test_create_key_api_key_provider_runs_formal_three_steps() -> None:
         KeyStateMachine(),
         build_provider_registry(plugin),
     )
-    service._schedule_pending_validation = lambda key_id: None
+    scheduled: list[str] = []
+    service._schedule_pending_validation = scheduled.append
 
     key = await service.create_key(CreateKeyInput(provider="openai", credential={"api_key": "sk-new"}))
 
-    assert plugin.available_checks == [{"api_key": "sk-new"}]
-    assert key.cached_available is True
-    assert key.cached_quota_available is True
-    assert key.supported_models == ["gpt-4o"]
+    assert scheduled == [key.id]
+    assert plugin.available_checks == []
+    assert key.status == KeyStatus.PENDING
+    assert key.cached_available is None
+    assert key.cached_quota_available is None
+    assert key.supported_models == []
 
 
 @pytest.mark.anyio
@@ -1659,7 +1752,8 @@ async def test_create_key_oauth_refresh_failure_persists_disabled_upstream() -> 
         KeyStateMachine(),
         build_provider_registry(plugin),
     )
-    service._schedule_pending_validation = lambda key_id: None
+    scheduled: list[str] = []
+    service._schedule_pending_validation = scheduled.append
 
     key = await service.create_key(
         CreateKeyInput(
@@ -1668,8 +1762,9 @@ async def test_create_key_oauth_refresh_failure_persists_disabled_upstream() -> 
         )
     )
 
-    assert key.status == KeyStatus.DISABLED_UPSTREAM
-    assert repository._keys[key.id].status == KeyStatus.DISABLED_UPSTREAM
+    assert scheduled == [key.id]
+    assert key.status == KeyStatus.PENDING
+    assert repository._keys[key.id].status == KeyStatus.PENDING
     assert plugin.available_checks == []
 
 
@@ -1715,13 +1810,15 @@ async def test_create_key_sets_disabled_upstream_when_initial_availability_probe
         KeyStateMachine(),
         build_provider_registry(plugin),
     )
-    service._schedule_pending_validation = lambda key_id: None
+    scheduled: list[str] = []
+    service._schedule_pending_validation = scheduled.append
 
     key = await service.create_key(CreateKeyInput(provider="openai", credential={"api_key": "sk-new"}))
 
-    assert key.status == KeyStatus.DISABLED_UPSTREAM
-    assert repository._keys[key.id].status == KeyStatus.DISABLED_UPSTREAM
-    assert plugin.available_checks == [{"api_key": "sk-new"}]
+    assert scheduled == [key.id]
+    assert key.status == KeyStatus.PENDING
+    assert repository._keys[key.id].status == KeyStatus.PENDING
+    assert plugin.available_checks == []
 
 
 @pytest.mark.anyio
@@ -2628,12 +2725,44 @@ async def test_report_success_updates_priority_fields_without_changing_status() 
         build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
     )
 
-    updated = await service.report_success("key-1", tokens_used=12)
+    updated = await service.report_success("key-1", "lease-1", tokens_used=12)
 
     assert updated.status == KeyStatus.DISABLED_ADMIN
     assert updated.success_count == 1
     assert updated.quota_used == 12
     assert allocation_store.released == [("openai", "default", "key-1")]
+
+
+@pytest.mark.anyio
+async def test_report_success_releases_lease_when_plugin_callback_fails() -> None:
+    class _FailingMarkSuccessPlugin(FakeProviderPlugin):
+        async def mark_success(self, credential: dict[str, Any], meta: dict | None = None) -> None:
+            raise RuntimeError("mark failed")
+
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+            )
+        ]
+    )
+    allocation_store = InMemoryAllocationStore()
+    service = KeyService(
+        repository,
+        allocation_store,
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(_FailingMarkSuccessPlugin("openai", ["gpt-4o"])),
+    )
+
+    updated = await service.report_success("key-1", "lease-1", tokens_used=1)
+
+    assert updated.success_count == 1
+    assert allocation_store.released == [("openai", "default", "key-1", "lease-1")]
 
 
 @pytest.mark.anyio
@@ -2644,12 +2773,12 @@ async def test_report_success_does_not_overwrite_runtime_refresh_fields() -> Non
         async def get_key(self, key_id: str) -> ApiKey | None:
             return deepcopy(await super().get_key(key_id))
 
-        async def record_success(self, key_id: str, tokens_used: int, now: datetime) -> ApiKey | None:
-            current = self._keys[key_id]
+        async def record_success_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+            current = self._keys[key.id]
             current.credential = {"api_key": "new-token"}
             current.cached_available = True
             current.last_refreshed_at = now
-            return await super().record_success(key_id, tokens_used, now)
+            return await super().record_success_report_state(key, now)
 
     repository = _RuntimeWinsRepository(
         [
@@ -2671,7 +2800,7 @@ async def test_report_success_does_not_overwrite_runtime_refresh_fields() -> Non
         build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
     )
 
-    updated = await service.report_success("key-1", tokens_used=3)
+    updated = await service.report_success("key-1", "lease-1", tokens_used=3)
 
     assert updated.credential == {"api_key": "new-token"}
     assert repository._keys["key-1"].credential == {"api_key": "new-token"}
@@ -2702,11 +2831,139 @@ async def test_report_error_updates_priority_fields_without_changing_status() ->
         build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
     )
 
-    updated = await service.report_error("key-1", "rate_limit")
+    updated = await service.report_error("key-1", "lease-1", "rate_limit")
 
-    assert updated.status == KeyStatus.EXHAUSTED
+    assert updated.status == KeyStatus.RATE_LIMITED
     assert updated.error_count == 1
     assert allocation_store.released == [("openai", "default", "key-1")]
+
+
+@pytest.mark.anyio
+async def test_report_error_releases_lease_when_plugin_callback_fails() -> None:
+    class _FailingMarkErrorPlugin(FakeProviderPlugin):
+        async def mark_error(self, credential: dict[str, Any], error_meta: dict | None = None) -> None:
+            raise RuntimeError("mark failed")
+
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+            )
+        ]
+    )
+    allocation_store = InMemoryAllocationStore()
+    service = KeyService(
+        repository,
+        allocation_store,
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(_FailingMarkErrorPlugin("openai", ["gpt-4o"])),
+    )
+
+    updated = await service.report_error("key-1", "lease-1", "network_timeout")
+
+    assert updated.error_count == 1
+    assert allocation_store.released == [("openai", "default", "key-1", "lease-1")]
+
+
+@pytest.mark.anyio
+async def test_report_error_rate_limit_sets_rate_limited_status() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+                last_refreshed_at=now,
+            )
+        ]
+    )
+    allocation_store = InMemoryAllocationStore()
+    service = KeyService(
+        repository,
+        allocation_store,
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    updated = await service.report_error("key-1", "lease-1", "rate_limit")
+
+    assert updated.status == KeyStatus.RATE_LIMITED
+    assert updated.cooldown_until is not None
+    assert updated.rate_limit_rounds == 1
+    assert updated.error_count == 1
+    assert allocation_store.released == [("openai", "default", "key-1")]
+
+
+@pytest.mark.anyio
+async def test_report_error_transient_failures_upgrade_to_disabled_report() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    for index in range(15):
+        updated = await service.report_error("key-1", f"lease-{index}", "network_timeout")
+
+    assert updated.status == KeyStatus.DISABLED_REPORT
+    assert updated.cooldown_failure_rounds == 3
+    assert updated.cooldown_until is None
+
+
+@pytest.mark.anyio
+async def test_report_success_clears_short_term_report_counters_only() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.DISABLED_REPORT,
+                consecutive_error_count=4,
+                cooldown_failure_rounds=2,
+                rate_limit_rounds=3,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    updated = await service.report_success("key-1", "lease-1", tokens_used=7)
+
+    assert updated.status == KeyStatus.DISABLED_REPORT
+    assert updated.success_count == 1
+    assert updated.quota_used == 7
+    assert updated.consecutive_error_count == 0
+    assert updated.rate_limit_rounds == 0
+    assert updated.cooldown_failure_rounds == 2
 
 
 @pytest.mark.anyio
@@ -2717,13 +2974,20 @@ async def test_report_error_does_not_overwrite_runtime_refresh_fields() -> None:
         async def get_key(self, key_id: str) -> ApiKey | None:
             return deepcopy(await super().get_key(key_id))
 
-        async def record_error(self, key_id: str, now: datetime) -> ApiKey | None:
-            current = self._keys[key_id]
+        async def record_error_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+            current = self._keys[key.id]
             current.credential = {"api_key": "new-token"}
             current.cached_available = False
             current.status = KeyStatus.DISABLED_UPSTREAM
             current.last_refreshed_at = now
-            return await super().record_error(key_id, now)
+            current.error_count = key.error_count
+            current.last_used_at = key.last_used_at
+            current.consecutive_error_count = key.consecutive_error_count
+            current.cooldown_failure_rounds = key.cooldown_failure_rounds
+            current.rate_limit_rounds = key.rate_limit_rounds
+            current.last_report_error_type = key.last_report_error_type
+            current.updated_at = now
+            return current
 
     repository = _RuntimeWinsRepository(
         [
@@ -2744,7 +3008,7 @@ async def test_report_error_does_not_overwrite_runtime_refresh_fields() -> None:
         build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
     )
 
-    updated = await service.report_error("key-1", "network_timeout")
+    updated = await service.report_error("key-1", "lease-1", "network_timeout")
 
     assert updated.credential == {"api_key": "new-token"}
     assert updated.status == KeyStatus.DISABLED_UPSTREAM
@@ -2862,6 +3126,151 @@ async def test_background_runtime_persist_does_not_write_after_concurrent_admin_
 
 
 @pytest.mark.anyio
+async def test_refresh_does_not_hold_runtime_lock_during_provider_probe() -> None:
+    now = datetime.now(timezone.utc) - timedelta(minutes=10)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+                last_refreshed_at=now,
+            )
+        ]
+    )
+
+    class _LockProbePlugin(FakeProviderPlugin):
+        async def is_credential_available(self, credential: dict[str, Any]) -> bool:
+            assert repository._runtime_locks == {}
+            return await super().is_credential_available(credential)
+
+        async def get_capacity_signal(self, credential: dict[str, Any]) -> CapacitySignal | None:
+            assert repository._runtime_locks == {}
+            return await super().get_capacity_signal(credential)
+
+        async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
+            assert repository._runtime_locks == {}
+            return await super().fetch_models(credential)
+
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(_LockProbePlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    assert await service.refresh_keys() == 1
+    assert repository._keys["key-1"].status == KeyStatus.AVAILABLE
+
+
+@pytest.mark.anyio
+async def test_refresh_does_not_write_after_concurrent_credential_change() -> None:
+    now = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    class _CredentialChangesBeforePersistRepository(InMemoryKeyRepository):
+        async def acquire_runtime_lock(
+            self,
+            key_id: str,
+            owner: str,
+            now: datetime,
+            ttl_seconds: int,
+            reason: str,
+        ) -> bool:
+            acquired = await super().acquire_runtime_lock(
+                key_id,
+                owner,
+                now,
+                ttl_seconds,
+                reason,
+            )
+            if acquired:
+                self._keys[key_id].credential = {"api_key": "sk-new"}
+            return acquired
+
+    repository = _CredentialChangesBeforePersistRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-old"},
+                status=KeyStatus.AVAILABLE,
+                supported_models=["old-model"],
+                last_refreshed_at=now,
+                cached_available=False,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["new-model"], available=True)),
+    )
+
+    assert await service.refresh_keys() == 0
+    assert repository._keys["key-1"].credential == {"api_key": "sk-new"}
+    assert repository._keys["key-1"].supported_models == ["old-model"]
+    assert repository._keys["key-1"].cached_available is False
+    assert repository._keys["key-1"].last_refreshed_at == now
+
+
+@pytest.mark.anyio
+async def test_refresh_does_not_overwrite_concurrent_report_counters() -> None:
+    now = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    class _ReportCountersChangeBeforePersistRepository(InMemoryKeyRepository):
+        async def update_background_runtime_snapshot_if_locked(
+            self,
+            key: ApiKey,
+            owner: str,
+            now: datetime,
+        ) -> ApiKey | None:
+            current = self._keys[key.id]
+            current.consecutive_error_count = 4
+            current.cooldown_failure_rounds = 2
+            current.rate_limit_rounds = 3
+            current.last_report_error_type = "network_timeout"
+            return await super().update_background_runtime_snapshot_if_locked(key, owner, now)
+
+    repository = _ReportCountersChangeBeforePersistRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.AVAILABLE,
+                consecutive_error_count=1,
+                cooldown_failure_rounds=1,
+                rate_limit_rounds=1,
+                last_report_error_type="rate_limit",
+                last_refreshed_at=now,
+                cached_available=False,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    assert await service.refresh_keys() == 1
+    assert repository._keys["key-1"].cached_available is True
+    assert repository._keys["key-1"].consecutive_error_count == 4
+    assert repository._keys["key-1"].cooldown_failure_rounds == 2
+    assert repository._keys["key-1"].rate_limit_rounds == 3
+    assert repository._keys["key-1"].last_report_error_type == "network_timeout"
+
+
+@pytest.mark.anyio
 async def test_update_key_does_not_overwrite_concurrent_priority_fields() -> None:
     now = datetime.now(timezone.utc)
     concurrent_last_used = now - timedelta(seconds=5)
@@ -2916,6 +3325,166 @@ async def test_update_key_does_not_overwrite_concurrent_priority_fields() -> Non
     assert repository._keys["key-1"].success_count == 9
     assert repository._keys["key-1"].error_count == 2
     assert repository._keys["key-1"].last_used_at == concurrent_last_used
+
+
+@pytest.mark.anyio
+async def test_update_key_credential_does_not_hold_lock_during_provider_probe() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-old"},
+                status=KeyStatus.AVAILABLE,
+            )
+        ]
+    )
+
+    class _LockProbePlugin(FakeProviderPlugin):
+        async def is_credential_available(self, credential: dict[str, Any]) -> bool:
+            assert repository._runtime_locks == {}
+            return await super().is_credential_available(credential)
+
+        async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
+            assert repository._runtime_locks == {}
+            return await super().fetch_models(credential)
+
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(_LockProbePlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    updated = await service.update_key("key-1", UpdateKeyInput(credential={"api_key": "sk-new"}))
+
+    assert updated.credential == {"api_key": "sk-new"}
+
+
+@pytest.mark.anyio
+async def test_update_key_restore_admin_does_not_hold_lock_during_provider_probe() -> None:
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.DISABLED_ADMIN,
+            )
+        ]
+    )
+
+    class _LockProbePlugin(FakeProviderPlugin):
+        async def is_credential_available(self, credential: dict[str, Any]) -> bool:
+            assert repository._runtime_locks == {}
+            return await super().is_credential_available(credential)
+
+        async def fetch_models(self, credential: dict[str, Any]) -> list[str]:
+            assert repository._runtime_locks == {}
+            return await super().fetch_models(credential)
+
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(_LockProbePlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    updated = await service.update_key("key-1", UpdateKeyInput(status=KeyStatus.AVAILABLE))
+
+    assert updated.status == KeyStatus.AVAILABLE
+
+
+@pytest.mark.anyio
+async def test_update_key_credential_rejects_runtime_lock_at_write_time() -> None:
+    now = datetime.now(timezone.utc)
+
+    class _LockedBeforeWriteRepository(InMemoryKeyRepository):
+        async def acquire_runtime_lock(
+            self,
+            key_id: str,
+            owner: str,
+            now: datetime,
+            ttl_seconds: int,
+            reason: str,
+        ) -> bool:
+            if reason == "update_key":
+                self._runtime_locks[key_id] = (
+                    "refresh_keys:busy",
+                    now + timedelta(seconds=ttl_seconds),
+                    "refresh_keys",
+                )
+            return await super().acquire_runtime_lock(key_id, owner, now, ttl_seconds, reason)
+
+    repository = _LockedBeforeWriteRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-old"},
+                status=KeyStatus.AVAILABLE,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    with pytest.raises(RuntimeLockUnavailableError):
+        await service.update_key("key-1", UpdateKeyInput(credential={"api_key": "sk-new"}))
+
+
+@pytest.mark.anyio
+async def test_update_key_restore_admin_rejects_runtime_lock_at_write_time() -> None:
+    now = datetime.now(timezone.utc)
+
+    class _LockedBeforeWriteRepository(InMemoryKeyRepository):
+        async def acquire_runtime_lock(
+            self,
+            key_id: str,
+            owner: str,
+            now: datetime,
+            ttl_seconds: int,
+            reason: str,
+        ) -> bool:
+            if reason == "restore_admin":
+                self._runtime_locks[key_id] = (
+                    "refresh_keys:busy",
+                    now + timedelta(seconds=ttl_seconds),
+                    "refresh_keys",
+                )
+            return await super().acquire_runtime_lock(key_id, owner, now, ttl_seconds, reason)
+
+    repository = _LockedBeforeWriteRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.DISABLED_ADMIN,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+    )
+
+    with pytest.raises(RuntimeLockUnavailableError):
+        await service.update_key("key-1", UpdateKeyInput(status=KeyStatus.AVAILABLE))
 
 
 @pytest.mark.anyio
@@ -3005,8 +3574,8 @@ async def test_report_success_does_not_recreate_deleted_key() -> None:
     now = datetime.now(timezone.utc)
 
     class _DeleteOnSuccessRepository(InMemoryKeyRepository):
-        async def record_success(self, key_id: str, tokens_used: int, now: datetime) -> ApiKey | None:
-            self._keys.pop(key_id, None)
+        async def record_success_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+            self._keys.pop(key.id, None)
             return None
 
     repository = _DeleteOnSuccessRepository(
@@ -3031,7 +3600,7 @@ async def test_report_success_does_not_recreate_deleted_key() -> None:
     )
 
     with pytest.raises(KeyNotFoundError):
-        await service.report_success("key-1", tokens_used=10)
+        await service.report_success("key-1", "lease-1", tokens_used=10)
 
     assert "key-1" not in repository._keys
     assert allocation_store.released == []
@@ -3043,8 +3612,8 @@ async def test_report_error_does_not_recreate_deleted_key() -> None:
     now = datetime.now(timezone.utc)
 
     class _DeleteOnErrorRepository(InMemoryKeyRepository):
-        async def record_error(self, key_id: str, now: datetime) -> ApiKey | None:
-            self._keys.pop(key_id, None)
+        async def record_error_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+            self._keys.pop(key.id, None)
             return None
 
     repository = _DeleteOnErrorRepository(
@@ -3069,11 +3638,100 @@ async def test_report_error_does_not_recreate_deleted_key() -> None:
     )
 
     with pytest.raises(KeyNotFoundError):
-        await service.report_error("key-1", "network_timeout")
+        await service.report_error("key-1", "lease-1", "network_timeout")
 
-    assert "key-1" not in repository._keys
-    assert allocation_store.released == []
-    assert "key-1" not in allocation_store.synced_scores
+
+@pytest.mark.anyio
+async def test_refresh_keys_recovers_disabled_report_to_available() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.DISABLED_REPORT,
+                last_refreshed_at=now - timedelta(minutes=10),
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+        refresh_cache_seconds=60,
+    )
+
+    refreshed = await service.refresh_keys()
+
+    assert refreshed == 1
+    assert repository._keys["key-1"].status == KeyStatus.AVAILABLE
+    assert repository._keys["key-1"].cached_available is True
+
+
+@pytest.mark.anyio
+async def test_refresh_keys_moves_disabled_report_to_disabled_upstream_when_unavailable() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.DISABLED_REPORT,
+                last_refreshed_at=now - timedelta(minutes=10),
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=False)),
+        refresh_cache_seconds=60,
+    )
+
+    refreshed = await service.refresh_keys()
+
+    assert refreshed == 1
+    assert repository._keys["key-1"].status == KeyStatus.DISABLED_UPSTREAM
+    assert repository._keys["key-1"].cached_available is False
+
+
+@pytest.mark.anyio
+async def test_fresh_availability_check_skips_active_temporary_block() -> None:
+    now = datetime.now(timezone.utc)
+    repository = InMemoryKeyRepository(
+        [
+            ApiKey(
+                id="key-1",
+                provider="openai",
+                credential={"api_key": "sk-test"},
+                status=KeyStatus.RATE_LIMITED,
+                cooldown_until=now + timedelta(minutes=5),
+                last_refreshed_at=now,
+            )
+        ]
+    )
+    service = KeyService(
+        repository,
+        InMemoryAllocationStore(),
+        KeyScheduler(KeyScorer(), jitter=0.0),
+        KeyScorer(),
+        KeyStateMachine(),
+        build_provider_registry(FakeProviderPlugin("openai", ["gpt-4o"], available=True)),
+        refresh_cache_seconds=60,
+    )
+
+    refreshed = await service.refresh_keys()
+
+    assert refreshed == 0
+    assert repository._keys["key-1"].status == KeyStatus.RATE_LIMITED
 
 
 @pytest.mark.anyio

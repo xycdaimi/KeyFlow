@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
 
-from sqlalchemy import select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from gateway.models import GatewayNodeModel
@@ -78,6 +78,9 @@ class GatewayNodeRepository(Protocol):
     async def record_probe(self, node_id: str, status: ProbeStatus, error: str | None) -> GatewayNode | None:
         raise NotImplementedError
 
+    async def prune_stale_nodes(self, cutoff: datetime) -> int:
+        raise NotImplementedError
+
 
 class SQLiteGatewayNodeRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -112,6 +115,23 @@ class SQLiteGatewayNodeRepository:
         async with self._session_factory() as session:
             result = await session.execute(select(GatewayNodeModel).order_by(GatewayNodeModel.node_id))
             return [self._to_entity(model) for model in result.scalars()]
+
+    async def prune_stale_nodes(self, cutoff: datetime) -> int:
+        async with self._session_factory() as session:
+            result = await session.execute(
+                delete(GatewayNodeModel).where(
+                    GatewayNodeModel.enabled.is_(True),
+                    or_(
+                        GatewayNodeModel.last_heartbeat_at <= cutoff,
+                        and_(
+                            GatewayNodeModel.last_heartbeat_at.is_(None),
+                            GatewayNodeModel.registered_at <= cutoff,
+                        ),
+                    ),
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
 
     async def register_node(self, payload: GatewayNodeCreate) -> GatewayNode:
         now = utc_now()

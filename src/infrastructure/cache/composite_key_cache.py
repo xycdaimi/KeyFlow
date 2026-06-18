@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-05
 @Description: Redis 优先、数据库兜底的 Key 原子分配租约
 """
 from __future__ import annotations
@@ -11,10 +11,14 @@ from datetime import datetime
 
 from domain.entities.api_key import ApiKey
 from domain.exceptions.domain_exceptions import AllocationStoreUnavailableError
-from domain.repositories.key_repository import KeyAllocationStore
+from domain.repositories.key_repository import AllocationLease, KeyAllocationStore
 from domain.value_objects.key_pool import KeyPool
 
 logger = logging.getLogger(__name__)
+
+
+def _lease_kwargs(lease_id: str | None) -> dict[str, str]:
+    return {} if lease_id is None else {"lease_id": lease_id}
 
 
 class CompositeKeyCache(KeyAllocationStore):
@@ -58,29 +62,32 @@ class CompositeKeyCache(KeyAllocationStore):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         try:
-            allocated_id = await self._primary.allocate_key(
+            lease = await self._primary.allocate_key(
                 provider,
                 pool,
                 ordered_key_ids,
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=allow_leased_fallback,
+                **_lease_kwargs(lease_id),
             )
-            if allocated_id is not None:
+            if lease is not None:
                 try:
-                    await self._fallback.allocate_key(
+                    fallback_lease = await self._fallback.allocate_key(
                         provider,
                         pool,
-                        [allocated_id],
+                        [lease.key_id],
                         now,
                         lease_seconds=lease_seconds,
                         allow_leased_fallback=False,
+                        **_lease_kwargs(lease.lease_id),
                     )
                 except Exception as exc:
-                    logger.warning("fallback allocation mirror failed for %s: %s", allocated_id, exc)
-                return allocated_id
+                    logger.warning("fallback allocation mirror failed for %s: %s", lease.key_id, exc)
+                return lease
             return None
         except Exception as exc:
             logger.warning("primary allocation failed, using fallback: %s", exc)
@@ -92,6 +99,7 @@ class CompositeKeyCache(KeyAllocationStore):
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=allow_leased_fallback,
+                **_lease_kwargs(lease_id),
             )
         except Exception as exc:
             raise AllocationStoreUnavailableError("fallback allocation store failed") from exc
@@ -103,34 +111,37 @@ class CompositeKeyCache(KeyAllocationStore):
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         try:
-            allocated_id = await self._primary.allocate_key_any_provider(
+            lease = await self._primary.allocate_key_any_provider(
                 pool,
                 ordered_keys,
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=allow_leased_fallback,
+                **_lease_kwargs(lease_id),
             )
-            if allocated_id is not None:
-                provider = self._provider_for_key(ordered_keys, allocated_id)
+            if lease is not None:
+                provider = self._provider_for_key(ordered_keys, lease.key_id)
                 if provider is not None:
                     try:
-                        await self._fallback.allocate_key(
+                        fallback_lease = await self._fallback.allocate_key(
                             provider,
                             pool,
-                            [allocated_id],
+                            [lease.key_id],
                             now,
                             lease_seconds=lease_seconds,
                             allow_leased_fallback=False,
+                            **_lease_kwargs(lease.lease_id),
                         )
                     except Exception as exc:
                         logger.warning(
                             "fallback model allocation mirror failed for %s: %s",
-                            allocated_id,
+                            lease.key_id,
                             exc,
                         )
-                return allocated_id
+                return lease
             return None
         except Exception as exc:
             logger.warning("primary model allocation failed, using fallback: %s", exc)
@@ -141,19 +152,20 @@ class CompositeKeyCache(KeyAllocationStore):
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=allow_leased_fallback,
+                **_lease_kwargs(lease_id),
             )
         except Exception as exc:
             raise AllocationStoreUnavailableError("fallback model allocation store failed") from exc
 
-    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str) -> None:
+    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str, lease_id: str) -> None:
         primary_error: Exception | None = None
         try:
-            await self._primary.release_key_lease(provider, pool, key_id)
+            await self._primary.release_key_lease(provider, pool, key_id, lease_id)
         except Exception as exc:
             primary_error = exc
             logger.warning("primary lease release failed for %s: %s", key_id, exc)
         try:
-            await self._fallback.release_key_lease(provider, pool, key_id)
+            await self._fallback.release_key_lease(provider, pool, key_id, lease_id)
         except Exception as exc:
             if primary_error is not None:
                 raise AllocationStoreUnavailableError("all allocation stores failed to release lease") from exc

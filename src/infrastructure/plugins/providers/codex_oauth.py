@@ -27,9 +27,6 @@ _CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _CODEX_VERSION = "0.124.0"
 
 _BASE_MODELS: list[str] = [
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
     "gpt-5.4",
     "gpt-5.4-mini",
     "gpt-5.5",

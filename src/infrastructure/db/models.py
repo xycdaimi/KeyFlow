@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: SQLAlchemy 数据库模型
 """
 from __future__ import annotations
@@ -40,6 +40,10 @@ class ApiKeyModel(Base):
     quota_used: Mapped[int] = mapped_column(Integer, default=0)
     success_count: Mapped[int] = mapped_column(Integer, default=0)
     error_count: Mapped[int] = mapped_column(Integer, default=0)
+    consecutive_error_count: Mapped[int] = mapped_column(Integer, default=0)
+    cooldown_failure_rounds: Mapped[int] = mapped_column(Integer, default=0)
+    rate_limit_rounds: Mapped[int] = mapped_column(Integer, default=0)
+    last_report_error_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     supported_models: Mapped[list] = mapped_column(JSON, default=list)
@@ -65,10 +69,10 @@ class ApiKeyModel(Base):
 class KeyLeaseModel(Base):
     __tablename__ = "key_leases"
 
-    key_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    lease_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    key_id: Mapped[str] = mapped_column(String(64), index=True)
     provider: Mapped[str] = mapped_column(String(64), index=True)
     pool: Mapped[str] = mapped_column(String(32), default="default", index=True)
     lease_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    active_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

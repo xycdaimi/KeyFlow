@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-05
 @Description: API 请求数据模型
 """
 from typing import Any
@@ -16,20 +16,24 @@ class AllocateRequest(BaseModel):
     provider: str
     model: str | None = None
     pool: KeyPool = KeyPool.DEFAULT
+    lease_seconds: int = Field(default=2, ge=1)
 
 
 class AllocateByModelRequest(BaseModel):
     model: str
     pool: KeyPool = KeyPool.DEFAULT
+    lease_seconds: int = Field(default=2, ge=1)
 
 
 class ReportErrorRequest(BaseModel):
     key_id: str
+    lease_id: str
     error_type: str
 
 
 class ReportSuccessRequest(BaseModel):
     key_id: str
+    lease_id: str
     tokens_used: int = Field(default=0, ge=0)
 
 

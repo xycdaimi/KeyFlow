@@ -322,12 +322,13 @@ def test_allocate_and_report_cycle() -> None:
     assert allocate_response.status_code == 200
     payload = allocate_response.json()
     assert payload["key_id"] == "key-1"
+    assert payload["lease_id"]
     assert payload["provider_model"] is None
     assert payload["credential"] == {"api_key": "sk-test"}
 
     success_response = client.post(
         "/api/internal/report-success",
-        json={"key_id": "key-1", "tokens_used": 12},
+        json={"key_id": "key-1", "lease_id": payload["lease_id"], "tokens_used": 12},
         headers={"X-Internal-Key": "test-key"},
     )
     assert success_response.status_code == 200
@@ -369,10 +370,16 @@ def test_allocate_recovers_expired_cooldown_inline() -> None:
 
 def test_report_error_accepts_generic_error_type() -> None:
     client = build_client()
+    allocate_response = client.post(
+        "/api/internal/allocate-key",
+        json={"provider": "openai"},
+        headers={"X-Internal-Key": "test-key"},
+    )
+    lease_id = allocate_response.json()["lease_id"]
 
     response = client.post(
         "/api/internal/report-error",
-        json={"key_id": "key-1", "error_type": "network_timeout"},
+        json={"key_id": "key-1", "lease_id": lease_id, "error_type": "network_timeout"},
         headers={"X-Internal-Key": "test-key"},
     )
     assert response.status_code == 200
@@ -465,8 +472,10 @@ def test_allocate_by_model_returns_provider_and_credential() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json() == {
+    payload = response.json()
+    assert payload == {
         "key_id": "key-1",
+        "lease_id": payload["lease_id"],
         "provider": "openai",
         "provider_model": "gpt-4o",
         "credential": {"api_key": "sk-test"},
@@ -811,7 +820,7 @@ def test_allocate_by_model_returns_404_when_no_key_available(monkeypatch: pytest
     client = build_client()
     service: KeyService = client.app.state.container.resolve(KeyService)
 
-    async def _fake_allocate_key_by_model(model: str, pool=None) -> AllocationResult:
+    async def _fake_allocate_key_by_model(model: str, pool=None, lease_seconds=None) -> AllocationResult:
         raise NoAvailableKeyError(f"no available key for {model}")
 
     monkeypatch.setattr(service, "allocate_key_by_model", _fake_allocate_key_by_model, raising=False)
@@ -832,7 +841,7 @@ def test_allocate_by_model_returns_503_when_allocation_store_unavailable(
     client = build_client()
     service: KeyService = client.app.state.container.resolve(KeyService)
 
-    async def _fake_allocate_key_by_model(model: str, pool=None) -> AllocationResult:
+    async def _fake_allocate_key_by_model(model: str, pool=None, lease_seconds=None) -> AllocationResult:
         raise AllocationStoreUnavailableError("allocation store unavailable")
 
     monkeypatch.setattr(service, "allocate_key_by_model", _fake_allocate_key_by_model, raising=False)
@@ -1283,13 +1292,11 @@ def test_admin_key_crud_and_model_sync() -> None:
     assert len(items) == 2
     created = next(item for item in items if item["credential"] == {"api_key": "sk-new"})
     assert created["key_id"] == key_id
-    assert created == {
-        "key_id": key_id,
-        "credential": {"api_key": "sk-new"},
-        "pool": "default",
-        "max_concurrent_uses": 1,
-        "status": "available",
-    }
+    assert created["key_id"] == key_id
+    assert created["credential"] == {"api_key": "sk-new"}
+    assert created["pool"] == "default"
+    assert created["max_concurrent_uses"] == 1
+    assert created["status"] in {"pending", "available"}
 
     update_response = client.put(
         f"/api/keys/{key_id}",

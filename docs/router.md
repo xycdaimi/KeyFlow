@@ -53,13 +53,18 @@
 
 ## 0.1 Runtime Concurrency Fields
 
+> 2026-06-05 起，运行期分配使用任务级租约。`key_id` 表示凭证，`lease_id` 表示某一次任务占用；同一个 `key_id` 可以同时存在多条未过期 `lease_id`。
+
 当前实现已支持凭证级并发占用上限，相关接口字段如下：
 
 - `POST /api/providers/{provider}/keys` 请求体新增 `max_concurrent_uses`，可选，整数，最小值 `1`，默认 `1`。该字段表示同一个凭证同一时间最多可以分配给多少个执行任务使用。
 - `PUT /api/keys/{key_id}` 请求体新增 `max_concurrent_uses`，可选，整数，最小值 `1`。可单独修改，不需要同时修改 `credential` 或 `status`。
 - `GET /api/providers/{provider}/keys` 响应项新增 `max_concurrent_uses`。
 - `GET /api/keys/{key_id}` 响应新增 `max_concurrent_uses`。
-- `POST /api/internal/report-success` 和 `POST /api/internal/report-error` 响应新增 `max_concurrent_uses`，并且都会释放该 `key_id` 的一次活跃分配占用。
+- `POST /api/internal/allocate-key` 和 `POST /api/internal/allocate-by-model` 请求体新增 `lease_seconds`，可选，整数，最小值 `1`。该字段表示本次任务预计最长占用凭证的秒数；不传时使用服务配置 `ALLOCATE_LEASE_SECONDS`。
+- `POST /api/internal/allocate-key` 和 `POST /api/internal/allocate-by-model` 响应新增 `lease_id`。每次成功分配都会生成一个独立任务级租约。
+- `POST /api/internal/report-success` 和 `POST /api/internal/report-error` 请求体必须携带 `lease_id`，用于精确释放本次任务租约。
+- `POST /api/internal/report-success` 和 `POST /api/internal/report-error` 响应新增 `max_concurrent_uses`，并且都会释放指定 `lease_id` 对应的一次活跃分配占用。
 
 创建凭证示例：
 
@@ -97,10 +102,12 @@
 
 运行期释放语义：
 
-- 分配成功后会占用该凭证 1 个活跃并发槽位。
-- `report-success` 会记录成功统计，并释放 1 个槽位。
-- `report-error` 会记录失败统计，并释放 1 个槽位。
-- 如果执行器在上报前异常退出，槽位会在 `ALLOCATE_LEASE_SECONDS` 到期后由分配流程兜底清理；当前示例配置为 `300` 秒。
+- 分配成功后会创建一条独立任务级租约，并占用该凭证 1 个活跃并发槽位。
+- 同一个 `key_id` 可以同时存在多条未过期租约；未过期租约数量达到 `max_concurrent_uses` 后，继续分配会返回 `404 no_available_key`。
+- `report-success` 会记录成功统计，并按 `lease_id` 精确释放 1 个槽位。
+- `report-error` 会记录失败统计，并按 `lease_id` 精确释放 1 个槽位。
+- 如果执行器在上报前异常退出，该任务租约会在本次分配传入的 `lease_seconds` 到期后由分配流程兜底清理；未传 `lease_seconds` 时使用 `ALLOCATE_LEASE_SECONDS`。
+- 长耗时任务应按任务预计最长执行时间传入 `lease_seconds`；任务提前结束则立即上报释放对应 `lease_id`。
 
 ## 1. `GET /health`
 
@@ -158,7 +165,8 @@ X-Internal-Key: dev-internal-key
 {
   "provider": "openai",
   "model": "gpt-4o",
-  "pool": "vip"
+  "pool": "vip",
+  "lease_seconds": 18000
 }
 ```
 
@@ -179,6 +187,7 @@ X-Internal-Key: dev-internal-key
 ```json
 {
   "key_id": "key-1",
+  "lease_id": "26967af4a4644da4ba6e8f3832c81939",
   "provider_model": "gpt-4o",
   "credential": {
     "api_key": "sk-test"
@@ -197,6 +206,12 @@ X-Internal-Key: dev-internal-key
 - `404`: `{"detail": "no_available_key"}`（当前无可分配 Key）
 - `503`: `{"detail": "allocation_store_unavailable"}`（分配协调层不可用）
 - `422`: 请求体校验失败（例如缺少 `provider`、类型错误）
+
+**租约字段说明**
+
+- `lease_seconds`: 本次任务预计最长占用凭证的秒数。执行时间不定的长任务应传入任务级超时时间，例如 `18000`。
+- `lease_id`: 本次分配生成的任务级租约 ID。调用方必须保存该值，并在 `report-success` 或 `report-error` 中原样带回。
+- `no_available_key` 表示当前候选凭证没有可用并发槽位或没有可用 Key。执行器可按自身队列策略等待后重试，不应把它等同于凭证永久失效。
 
 ## 2.1 `POST /api/internal/allocate-by-model`
 
@@ -220,7 +235,8 @@ X-Internal-Key: dev-internal-key
 ```json
 {
   "model": "gpt-4o",
-  "pool": "vip"
+  "pool": "vip",
+  "lease_seconds": 18000
 }
 ```
 
@@ -236,6 +252,7 @@ X-Internal-Key: dev-internal-key
 ```json
 {
   "key_id": "key-openrouter",
+  "lease_id": "b4abbdf60ad74e3bb55449bdf7f57d41",
   "provider": "openrouter",
   "provider_model": "openai/gpt-4o",
   "credential": {
@@ -257,11 +274,17 @@ X-Internal-Key: dev-internal-key
 - `503`: `{"detail": "allocation_store_unavailable"}`（分配协调层不可用）
 - `422`: 请求体校验失败（例如缺少 `model`）
 
+**租约字段说明**
+
+- `lease_seconds`: 本次任务预计最长占用凭证的秒数。执行时间不定的长任务应传入任务级超时时间，例如 `18000`。
+- `lease_id`: 本次分配生成的任务级租约 ID。调用方必须保存该值，并在 `report-success` 或 `report-error` 中原样带回。
+- `no_available_key` 表示当前候选凭证没有可用并发槽位或没有支持该模型的可用 Key。执行器可按自身队列策略等待后重试。
+
 ## 3. `POST /api/internal/report-error`
 
 **功能**
 
-上报某个已分配 Key 的失败结果，记录运行态失败统计，并把 `error_type` 透传给 provider 插件的 `mark_error` 钩子。当前实现不会按 `error_type` 直接改写 Key 状态。该接口会释放该 `key_id` 的一次活跃分配占用；如果执行器在上报前异常退出，租约会按 `ALLOCATE_LEASE_SECONDS` TTL 兜底过期。
+上报某个已分配 Key 的失败结果，记录运行态失败统计，并把 `error_type` 透传给 provider 插件的 `mark_error` 钩子。当前实现不会按 `error_type` 直接改写 Key 状态。该接口会释放 `lease_id` 对应的一次活跃分配占用；如果执行器在上报前异常退出，租约会按分配时传入的 `lease_seconds` TTL 兜底过期。
 
 **请求头**
 
@@ -274,6 +297,7 @@ X-Internal-Key: dev-internal-key
 ```json
 {
   "key_id": "key-1",
+  "lease_id": "26967af4a4644da4ba6e8f3832c81939",
   "error_type": "network_timeout"
 }
 ```
@@ -281,6 +305,7 @@ X-Internal-Key: dev-internal-key
 字段说明：
 
 - `key_id`: 必填，待上报的 Key ID
+- `lease_id`: 必填，分配接口返回的任务级租约 ID；必须与本次任务拿到的 `key_id` 匹配
 - `error_type`: 必填，错误类型字符串，例如 `network_timeout`、`rate_limit`、`auth_error`
 
 **成功返回示例**
@@ -305,13 +330,13 @@ X-Internal-Key: dev-internal-key
 
 - `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
-- `422`: 请求体校验失败（例如缺少 `key_id`、`error_type`）
+- `422`: 请求体校验失败（例如缺少 `key_id`、`lease_id`、`error_type`）
 
 ## 4. `POST /api/internal/report-success`
 
 **功能**
 
-上报某个已分配 Key 的成功结果，累计 token 使用量并更新评分相关统计。该接口会释放该 `key_id` 的一次活跃分配占用；如果执行器在上报前异常退出，租约会按 `ALLOCATE_LEASE_SECONDS` TTL 兜底过期。
+上报某个已分配 Key 的成功结果，累计 token 使用量并更新评分相关统计。该接口会释放 `lease_id` 对应的一次活跃分配占用；如果执行器在上报前异常退出，租约会按分配时传入的 `lease_seconds` TTL 兜底过期。
 
 **请求头**
 
@@ -324,6 +349,7 @@ X-Internal-Key: dev-internal-key
 ```json
 {
   "key_id": "key-1",
+  "lease_id": "26967af4a4644da4ba6e8f3832c81939",
   "tokens_used": 12
 }
 ```
@@ -331,6 +357,7 @@ X-Internal-Key: dev-internal-key
 字段说明：
 
 - `key_id`: 必填，待上报的 Key ID
+- `lease_id`: 必填，分配接口返回的任务级租约 ID；必须与本次任务拿到的 `key_id` 匹配
 - `tokens_used`: 可选，默认 `0`，最小值为 `0`
 
 **成功返回示例**
@@ -355,7 +382,7 @@ X-Internal-Key: dev-internal-key
 
 - `401`: `{"detail": "invalid internal key"}`
 - `404`: `{"detail": "key_not_found"}`
-- `422`: 请求体校验失败（例如 `tokens_used` 为负数）
+- `422`: 请求体校验失败（例如缺少 `lease_id`，或 `tokens_used` 为负数）
 
 ## 5. `POST /api/providers/{provider}/keys`
 
@@ -493,10 +520,10 @@ X-Internal-Key: <与 INTERNAL_API_KEY 一致>
 
 推荐给上游网关的运行结果上报方式：
 
-- 请求成功后调用 `POST /api/internal/report-success`
-- 命中限流后调用 `POST /api/internal/report-error`，`error_type=rate_limit`
-- 明确额度耗尽后调用 `POST /api/internal/report-error`，`error_type=quota_exhausted`
-- 其他失败按实际错误原因调用 `POST /api/internal/report-error`，传入稳定的 `error_type`
+- 请求成功后调用 `POST /api/internal/report-success`，带回本次分配返回的 `key_id` 和 `lease_id`
+- 命中限流后调用 `POST /api/internal/report-error`，带回本次分配返回的 `key_id` 和 `lease_id`，`error_type=rate_limit`
+- 明确额度耗尽后调用 `POST /api/internal/report-error`，带回本次分配返回的 `key_id` 和 `lease_id`，`error_type=quota_exhausted`
+- 其他失败按实际错误原因调用 `POST /api/internal/report-error`，带回本次分配返回的 `key_id` 和 `lease_id`，传入稳定的 `error_type`
 
 不要把“管理禁用”与“运行态上报”混为一谈：
 

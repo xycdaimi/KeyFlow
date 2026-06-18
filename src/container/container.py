@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-21
+@Date: 2026-06-08
 @Description: 应用依赖注入容器
 """
 from __future__ import annotations
@@ -25,6 +25,16 @@ from infrastructure.db.sqlite_session import create_sqlite_session_factory
 from infrastructure.logging.logger import configure_logging
 from infrastructure.plugins.base import ProviderRegistry
 from infrastructure.plugins.providers import *
+
+
+def _parse_report_backoff_minutes(value: str) -> tuple[int, ...]:
+    result: list[int] = []
+    for item in value.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        result.append(max(int(stripped), 1))
+    return tuple(result) or (1,)
 
 
 def create_container(settings: Settings) -> punq.Container:
@@ -61,19 +71,25 @@ def create_container(settings: Settings) -> punq.Container:
         )
     )
     scheduler = KeyScheduler(scorer, jitter=settings.allocate_jitter)
-    state_machine = KeyStateMachine()
+    state_machine = KeyStateMachine(
+        report_transient_failure_threshold=settings.report_transient_failure_threshold,
+        report_cooldown_disable_rounds=settings.report_cooldown_disable_rounds,
+        report_backoff_minutes=_parse_report_backoff_minutes(settings.report_backoff_minutes),
+    )
     provider_registry = ProviderRegistry()
     provider_registry.register(OpenAIPlugin())
     provider_registry.register(AnthropicPlugin())
     provider_registry.register(AntigravityOpenAiPlugin())
     provider_registry.register(AntigravityOauthPlugin())
     provider_registry.register(GeminiPlugin())
+    provider_registry.register(GeminiCustomPlugin())
     provider_registry.register(GeminiOauthPlugin())
     provider_registry.register(GeminiOpenAiPlugin())
     provider_registry.register(OpenRouterPlugin())
     provider_registry.register(GeminiWebProxyPlugin())
     provider_registry.register(CodexOpenAiPlugin())
     provider_registry.register(CodexOauthPlugin())
+    provider_registry.register(QwenImageEditPlugin())
     model_alias_resolver = ModelAliasResolver.from_yaml_file(settings.model_alias_config_path)
     service = KeyService(
         repository,

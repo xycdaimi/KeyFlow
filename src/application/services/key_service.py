@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: Key 生命周期与分配应用服务
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -25,7 +26,7 @@ from domain.exceptions.domain_exceptions import (
     ProviderNotReadyError,
     RuntimeLockUnavailableError,
 )
-from domain.repositories.key_repository import KeyAllocationStore, KeyRepository
+from domain.repositories.key_repository import AllocationLease, KeyAllocationStore, KeyRepository
 from domain.services.scheduler import KeyScheduler
 from domain.services.scorer import KeyScorer
 from domain.services.state_machine import KeyStateMachine
@@ -69,6 +70,7 @@ class UpdateKeyInput:
 @dataclass(slots=True)
 class AllocationResult:
     key: ApiKey
+    lease_id: str
     provider_model: str | None = None
 
 
@@ -123,12 +125,7 @@ class KeyService:
         )
         await self._repository.upsert_key(key)
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
-        if key.status == KeyStatus.PENDING:
-            validated = await self.validate_pending_key(key.id)
-            latest = await self._repository.get_key(key.id) if validated else None
-            if latest is not None:
-                return latest
-            self._schedule_pending_validation(key.id)
+        self._schedule_pending_validation(key.id)
         return key
 
     async def update_key(self, key_id: str, data: UpdateKeyInput) -> ApiKey:
@@ -150,35 +147,45 @@ class KeyService:
                 raise DuplicateCredentialError(
                     f"credential already exists for provider {key.provider} (key_id={existing.id})"
                 )
+            expected_credential = dict(key.credential)
+            expected_status = key.status
+            await plugin.verify_upstream_root_reachable()
+            work_key = deepcopy(key)
+            work_key.credential = credential
+            if restore_admin_with_credential:
+                work_key.status = KeyStatus.AVAILABLE
+                work_key.cooldown_until = None
+            sync_credential = await self._refresh_single_key(work_key, utcnow(), plugin=plugin)
+            if sync_credential is not None:
+                await self._sync_models(work_key, plugin=plugin, credential=sync_credential)
+
             owner = f"update_key:{uuid4()}"
-            now = utcnow()
+            lock_now = utcnow()
             if not await self._repository.acquire_runtime_lock(
-                key.id, owner, now, self._runtime_lock_seconds, "update_key"
+                work_key.id, owner, lock_now, self._runtime_lock_seconds, "update_key"
             ):
                 raise RuntimeLockUnavailableError(f"key {key_id} runtime snapshot is locked")
             try:
-                await plugin.verify_upstream_root_reachable()
-                key.credential = credential
+                latest = await self._repository.get_key(work_key.id)
+                if latest is None:
+                    raise KeyNotFoundError(f"key {key_id} not found")
+                if latest.status != expected_status or not self._credential_equals(
+                    latest.credential,
+                    expected_credential,
+                ):
+                    raise RuntimeLockUnavailableError(f"key {key_id} runtime snapshot is locked")
                 if restore_admin_with_credential:
-                    key.status = KeyStatus.AVAILABLE
-                    key.cooldown_until = None
-                sync_credential = await self._refresh_single_key(key, utcnow(), plugin=plugin)
-                if sync_credential is not None:
-                    await self._sync_models(key, plugin=plugin, credential=sync_credential)
-                latest = await self._repository.get_key(key.id)
-                if latest is not None:
-                    if restore_admin_with_credential:
-                        latest.credential = key.credential
-                        latest.status = key.status
-                        latest.cooldown_until = key.cooldown_until
-                        latest.supported_models = list(key.supported_models)
-                        latest.last_refreshed_at = key.last_refreshed_at
-                        latest.cached_available = key.cached_available
-                        latest.cached_quota_available = key.cached_quota_available
-                        latest.cached_capacity_score = key.cached_capacity_score
-                    else:
-                        self._merge_runtime_mutation(latest, key)
-                    key = latest
+                    latest.credential = work_key.credential
+                    latest.status = work_key.status
+                    latest.cooldown_until = work_key.cooldown_until
+                    latest.supported_models = list(work_key.supported_models)
+                    latest.last_refreshed_at = work_key.last_refreshed_at
+                    latest.cached_available = work_key.cached_available
+                    latest.cached_quota_available = work_key.cached_quota_available
+                    latest.cached_capacity_score = work_key.cached_capacity_score
+                else:
+                    self._merge_runtime_mutation(latest, work_key)
+                key = latest
                 persisted = await self._repository.update_runtime_snapshot_if_locked(
                     key, owner, utcnow()
                 )
@@ -214,66 +221,85 @@ class KeyService:
             else:
                 plugin = self._require_ready_provider(key.provider)
                 now = utcnow()
-                owner = f"restore_admin:{uuid4()}"
-                if not await self._repository.acquire_runtime_lock(
-                    key.id, owner, now, self._runtime_lock_seconds, "restore_admin"
-                ):
-                    raise RuntimeLockUnavailableError(f"key {key_id} runtime snapshot is locked")
-                try:
-                    key.cooldown_until = None
-                    probe_credential = await self._run_key_preflight(key, plugin)
-                    if probe_credential is None:
-                        key.supported_models = []
+                expected_credential = dict(key.credential)
+                key = deepcopy(key)
+                key.cooldown_until = None
+                probe_credential = await self._run_key_preflight(key, plugin)
+                if probe_credential is None:
+                    key.supported_models = []
+                    key.cached_available = False
+                    key.cached_quota_available = None
+                    key.cached_capacity_score = None
+                    key.last_refreshed_at = now
+                    key.status = KeyStatus.DISABLED_UPSTREAM
+                else:
+                    try:
+                        key.cached_available = await plugin.is_credential_available(
+                            probe_credential
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "is_credential_available failed for %s: %s", key.id, exc
+                        )
                         key.cached_available = False
+
+                    if key.cached_available is False:
+                        key.supported_models = []
                         key.cached_quota_available = None
                         key.cached_capacity_score = None
                         key.last_refreshed_at = now
                         key.status = KeyStatus.DISABLED_UPSTREAM
                     else:
                         try:
-                            key.cached_available = await plugin.is_credential_available(
-                                probe_credential
-                            )
+                            signal = await plugin.get_capacity_signal(probe_credential)
                         except Exception as exc:
                             logger.warning(
-                                "is_credential_available failed for %s: %s", key.id, exc
+                                "get_capacity_signal failed for %s: %s", key.id, exc
                             )
-                            key.cached_available = False
+                            signal = None
 
-                        if key.cached_available is False:
-                            key.supported_models = []
-                            key.cached_quota_available = None
-                            key.cached_capacity_score = None
-                            key.last_refreshed_at = now
-                            key.status = KeyStatus.DISABLED_UPSTREAM
+                        key.cached_quota_available = (
+                            None if signal is None else signal.quota_available
+                        )
+                        key.cached_capacity_score = (
+                            None if signal is None else signal.capacity_score
+                        )
+                        key.last_refreshed_at = now
+                        await self._sync_models(
+                            key, plugin=plugin, credential=probe_credential
+                        )
+                        if key.cached_quota_available is False:
+                            key.status = KeyStatus.EXHAUSTED
                         else:
-                            try:
-                                signal = await plugin.get_capacity_signal(probe_credential)
-                            except Exception as exc:
-                                logger.warning(
-                                    "get_capacity_signal failed for %s: %s", key.id, exc
-                                )
-                                signal = None
+                            key.status = KeyStatus.AVAILABLE
 
-                            key.cached_quota_available = (
-                                None if signal is None else signal.quota_available
-                            )
-                            key.cached_capacity_score = (
-                                None if signal is None else signal.capacity_score
-                            )
-                            key.last_refreshed_at = now
-                            await self._sync_models(
-                                key, plugin=plugin, credential=probe_credential
-                            )
-                            if key.cached_quota_available is False:
-                                key.status = KeyStatus.EXHAUSTED
-                            else:
-                                key.status = KeyStatus.AVAILABLE
-
+                owner = f"restore_admin:{uuid4()}"
+                lock_now = utcnow()
+                if not await self._repository.acquire_runtime_lock(
+                    key.id, owner, lock_now, self._runtime_lock_seconds, "restore_admin"
+                ):
+                    raise RuntimeLockUnavailableError(f"key {key_id} runtime snapshot is locked")
+                try:
+                    latest = await self._repository.get_key(key.id)
+                    if latest is None:
+                        raise KeyNotFoundError(f"key {key_id} not found")
+                    if latest.status != KeyStatus.DISABLED_ADMIN or not self._credential_equals(
+                        latest.credential,
+                        expected_credential,
+                    ):
+                        raise RuntimeLockUnavailableError(f"key {key_id} runtime snapshot is locked")
+                    latest.credential = key.credential
+                    latest.status = key.status
+                    latest.cooldown_until = key.cooldown_until
+                    latest.supported_models = list(key.supported_models)
+                    latest.last_refreshed_at = key.last_refreshed_at
+                    latest.cached_available = key.cached_available
+                    latest.cached_quota_available = key.cached_quota_available
+                    latest.cached_capacity_score = key.cached_capacity_score
                     persisted = await self._repository.update_runtime_snapshot_if_locked(
-                        key,
+                        latest,
                         owner,
-                        now,
+                        utcnow(),
                     )
                     if persisted is None:
                         raise RuntimeLockUnavailableError(f"key {key_id} runtime snapshot is locked")
@@ -337,8 +363,10 @@ class KeyService:
         provider: str,
         model: str | None = None,
         pool: KeyPool = KeyPool.DEFAULT,
+        lease_seconds: int | None = None,
     ) -> AllocationResult:
         now = utcnow()
+        lease_seconds = self._normalize_lease_seconds(lease_seconds)
         provider = provider.strip().lower()
         last_error: NoAvailableKeyError | None = None
         for candidate_pool in _allocation_pool_sequence(pool):
@@ -362,6 +390,7 @@ class KeyService:
                     candidate_pool,
                     ordered_ids,
                     now,
+                    lease_seconds,
                 )
                 if allocated_id is None:
                     if not cache_repaired:
@@ -384,7 +413,7 @@ class KeyService:
                 except NoAvailableKeyError as exc:
                     last_error = exc
                     remaining_ranked = [
-                        item for item in remaining_ranked if item.key.id != allocated_id
+                        item for item in remaining_ranked if item.key.id != allocated_id.key_id
                     ]
                     continue
 
@@ -394,8 +423,10 @@ class KeyService:
         self,
         model: str,
         pool: KeyPool = KeyPool.DEFAULT,
+        lease_seconds: int | None = None,
     ) -> AllocationResult:
         now = utcnow()
+        lease_seconds = self._normalize_lease_seconds(lease_seconds)
         last_error: NoAvailableKeyError | None = None
         for candidate_pool in _allocation_pool_sequence(pool):
             keys = await self._repository.list_pool_keys(candidate_pool)
@@ -416,6 +447,7 @@ class KeyService:
                     candidate_pool,
                     [item.key for item in remaining_ranked],
                     now,
+                    lease_seconds,
                 )
                 if allocated_id is None:
                     if not cache_repaired:
@@ -425,11 +457,11 @@ class KeyService:
                     last_error = NoAvailableKeyError("no available key")
                     break
 
-                lease_provider = self._ranked_provider_for_key(remaining_ranked, allocated_id)
+                lease_provider = self._ranked_provider_for_key(remaining_ranked, allocated_id.key_id)
                 if lease_provider is None:
                     last_error = NoAvailableKeyError("no available key")
                     remaining_ranked = [
-                        item for item in remaining_ranked if item.key.id != allocated_id
+                        item for item in remaining_ranked if item.key.id != allocated_id.key_id
                     ]
                     continue
                 try:
@@ -445,7 +477,7 @@ class KeyService:
                 except NoAvailableKeyError as exc:
                     last_error = exc
                     remaining_ranked = [
-                        item for item in remaining_ranked if item.key.id != allocated_id
+                        item for item in remaining_ranked if item.key.id != allocated_id.key_id
                     ]
                     continue
 
@@ -457,14 +489,15 @@ class KeyService:
         pool: KeyPool,
         ordered_ids: list[str],
         now: datetime,
-    ) -> str | None:
+        lease_seconds: int,
+    ) -> AllocationLease | None:
         try:
             return await self._allocation_store.allocate_key(
                 provider,
                 pool,
                 ordered_ids,
                 now,
-                lease_seconds=self._allocation_lease_seconds,
+                lease_seconds=lease_seconds,
             )
         except AllocationStoreUnavailableError:
             raise
@@ -477,13 +510,14 @@ class KeyService:
         pool: KeyPool,
         ordered_keys: list[ApiKey],
         now: datetime,
-    ) -> str | None:
+        lease_seconds: int,
+    ) -> AllocationLease | None:
         try:
             return await self._allocation_store.allocate_key_any_provider(
                 pool,
                 ordered_keys,
                 now,
-                lease_seconds=self._allocation_lease_seconds,
+                lease_seconds=lease_seconds,
             )
         except AllocationStoreUnavailableError:
             raise
@@ -556,46 +590,68 @@ class KeyService:
     async def _finalize_allocation(
         self,
         ranked: list,
-        allocated_id: str,
+        lease: AllocationLease,
         now: datetime,
         provider_model_by_key_id: dict[str, str | None],
         lease_provider: str,
         lease_pool: KeyPool,
         requested_model: str | None,
     ) -> AllocationResult:
+        if isinstance(lease, str):
+            lease = AllocationLease(key_id=lease, lease_id="")
         try:
-            selected = await self._get_required_key(allocated_id)
+            selected = await self._get_required_key(lease.key_id)
         except KeyNotFoundError as exc:
-            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
+            await self._allocation_store.release_key_lease(
+                lease_provider,
+                lease_pool,
+                lease.key_id,
+                lease.lease_id,
+            )
             raise NoAvailableKeyError("no available key") from exc
 
         provider_model = self._resolve_current_provider_model(selected, requested_model)
         if (
-            not self._contains_ranked_key(ranked, allocated_id)
-            or selected.id != allocated_id
+            not self._contains_ranked_key(ranked, lease.key_id)
+            or selected.id != lease.key_id
             or selected.provider != lease_provider
             or selected.pool != lease_pool
             or not selected.is_available(now)
             or self._provider_registry.get(selected.provider) is None
             or (requested_model is not None and provider_model is None)
         ):
-            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
+            await self._allocation_store.release_key_lease(
+                lease_provider,
+                lease_pool,
+                lease.key_id,
+                lease.lease_id,
+            )
             raise NoAvailableKeyError("no available key")
         persisted = await self._repository.touch_key_used(selected.id, now)
         if persisted is None:
-            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
+            await self._allocation_store.release_key_lease(
+                lease_provider,
+                lease_pool,
+                lease.key_id,
+                lease.lease_id,
+            )
             raise NoAvailableKeyError("no available key")
         selected = persisted
         provider_model = self._resolve_current_provider_model(selected, requested_model)
         if (
-            selected.id != allocated_id
+            selected.id != lease.key_id
             or selected.provider != lease_provider
             or selected.pool != lease_pool
             or not selected.is_available(now)
             or self._provider_registry.get(selected.provider) is None
             or (requested_model is not None and provider_model is None)
         ):
-            await self._allocation_store.release_key_lease(lease_provider, lease_pool, allocated_id)
+            await self._allocation_store.release_key_lease(
+                lease_provider,
+                lease_pool,
+                lease.key_id,
+                lease.lease_id,
+            )
             raise NoAvailableKeyError("no available key")
         await self._allocation_store.sync_key(selected, self._scorer.score(selected, now))
         result_provider_model = (
@@ -605,6 +661,7 @@ class KeyService:
         )
         return AllocationResult(
             key=selected,
+            lease_id=lease.lease_id,
             provider_model=result_provider_model,
         )
 
@@ -617,39 +674,48 @@ class KeyService:
             supported_models=list(key.supported_models),
         )
 
-    async def report_success(self, key_id: str, tokens_used: int = 0) -> ApiKey:
+    async def report_success(self, key_id: str, lease_id: str, tokens_used: int = 0) -> ApiKey:
         now = utcnow()
         key = await self._get_required_key(key_id)
-        persisted = await self._repository.record_success(key_id, tokens_used, now)
+        self._state_machine.on_report_success(key, tokens_used, now)
+        persisted = await self._repository.record_success_report_state(key, now)
         if persisted is None:
             raise KeyNotFoundError(f"key {key_id} not found")
         key = persisted
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
-        plugin = self._provider_registry.get(key.provider)
-        if plugin is not None:
-            try:
+        try:
+            plugin = self._provider_registry.get(key.provider)
+            if plugin is not None:
                 await plugin.mark_success(key.credential, {"tokens_used": tokens_used})
-            except Exception as exc:
-                logger.warning("mark_success failed for %s: %s", key.id, exc)
-        await self._allocation_store.release_key_lease(key.provider, key.pool, key.id)
+        except Exception as exc:
+            logger.warning("mark_success failed for %s: %s", key.id, exc)
+        finally:
+            await self._allocation_store.release_key_lease(key.provider, key.pool, key.id, lease_id)
         return key
 
-    async def report_error(self, key_id: str, error_type: str) -> ApiKey:
+    async def report_error(self, key_id: str, lease_id: str, error_type: str) -> ApiKey:
         now = utcnow()
         key = await self._get_required_key(key_id)
-        persisted = await self._repository.record_error(key_id, now)
+        self._state_machine.on_report_error(key, error_type, now)
+        persisted = await self._repository.record_error_report_state(key, now)
         if persisted is None:
             raise KeyNotFoundError(f"key {key_id} not found")
         key = persisted
         await self._allocation_store.sync_key(key, self._scorer.score(key, now))
-        plugin = self._provider_registry.get(key.provider)
-        if plugin is not None:
-            try:
+        try:
+            plugin = self._provider_registry.get(key.provider)
+            if plugin is not None:
                 await plugin.mark_error(key.credential, {"error_type": error_type})
-            except Exception as exc:
-                logger.warning("mark_error failed for %s: %s", key.id, exc)
-        await self._allocation_store.release_key_lease(key.provider, key.pool, key.id)
+        except Exception as exc:
+            logger.warning("mark_error failed for %s: %s", key.id, exc)
+        finally:
+            await self._allocation_store.release_key_lease(key.provider, key.pool, key.id, lease_id)
         return key
+
+    def _normalize_lease_seconds(self, lease_seconds: int | None) -> int:
+        if lease_seconds is None:
+            return self._allocation_lease_seconds
+        return max(int(lease_seconds), 1)
 
     async def recover_cooldowns(self) -> int:
         now = utcnow()
@@ -673,70 +739,133 @@ class KeyService:
             await self._allocation_store.sync_key(key, self._scorer.score(key, now))
         return recovered_count
 
+    @staticmethod
+    def _is_active_temporary_block(key: ApiKey, now: datetime) -> bool:
+        return (
+            key.status in {KeyStatus.RATE_LIMITED, KeyStatus.COOLDOWN}
+            and key.cooldown_until is not None
+            and key.cooldown_until > now
+        )
+    
     async def refresh_keys(self) -> int:
         """Refresh availability/capacity for keys needing it."""
         now = utcnow()
         cutoff = now - timedelta(seconds=self._refresh_cache_seconds)
         keys_by_id = {key.id: key for key in await self._repository.list_keys_needing_refresh(cutoff)}
+        all_keys = await self._repository.list_keys()
         stale_pending = [
             key
-            for key in await self._repository.list_keys()
+            for key in all_keys
             if key.status == KeyStatus.PENDING and not self._is_fresh_pending(key, now)
         ]
         for key in stale_pending:
             keys_by_id.setdefault(key.id, key)
+        
+        
+        keys_to_check = [key for key in all_keys if key.id not in keys_by_id and key.status not in {KeyStatus.DISABLED_ADMIN} and not self._is_active_temporary_block(key, now)]
+
 
         refreshed = 0
         for key in keys_by_id.values():
+            if key.status == KeyStatus.DISABLED_ADMIN:
+                continue
             if key.status == KeyStatus.PENDING and self._is_fresh_pending(key, now):
                 continue
 
-            owner = f"refresh_keys:{uuid4()}"
-            if not await self._repository.acquire_runtime_lock(
-                key.id, owner, now, self._runtime_lock_seconds, "refresh_keys"
-            ):
+            latest = await self._repository.get_key(key.id)
+            if latest is None:
                 continue
-            try:
-                latest = await self._repository.get_key(key.id)
-                if latest is None:
+            if latest.status == KeyStatus.DISABLED_ADMIN:
+                continue
+            if latest.status == KeyStatus.PENDING:
+                if self._is_fresh_pending(latest, now):
                     continue
-                if latest.status in {KeyStatus.DISABLED_ADMIN, KeyStatus.DISABLED_REPORT}:
-                    continue
-                if latest.status == KeyStatus.PENDING:
-                    if self._is_fresh_pending(latest, now):
-                        continue
-                elif latest.last_refreshed_at is not None and latest.last_refreshed_at >= cutoff:
-                    continue
-                key = latest
-                plugin = self._provider_registry.get(key.provider)
-                if plugin is None:
-                    self._clear_supported_models_on_failure(key)
-                    key.cached_available = False
-                    key.cached_quota_available = None
-                    key.cached_capacity_score = None
-                    key.last_refreshed_at = now
-                    self._merge_refresh_signals_into_status(key, now)
-                    persisted = await self._persist_background_runtime_key(key, now, owner)
-                    if persisted is None:
-                        continue
-                    await self._allocation_store.sync_key(persisted, self._scorer.score(persisted, now))
-                    refreshed += 1
-                    continue
+            elif latest.last_refreshed_at is not None and latest.last_refreshed_at >= cutoff:
+                continue
 
-                sync_credential = await self._refresh_single_key(
+            key = deepcopy(latest)
+            expected_credential = dict(latest.credential)
+            allow_report_disabled = key.status == KeyStatus.DISABLED_REPORT
+            plugin = self._provider_registry.get(key.provider)
+            if plugin is None:
+                self._clear_supported_models_on_failure(
+                    key,
+                    allow_report_disabled=allow_report_disabled,
+                )
+                key.cached_available = False
+                key.cached_quota_available = None
+                key.cached_capacity_score = None
+                key.last_refreshed_at = now
+                self._merge_refresh_signals_into_status(
                     key,
                     now,
-                    plugin=plugin,
+                    allow_report_disabled=allow_report_disabled,
                 )
-                if sync_credential is not None:
-                    await self._sync_models(key, plugin=plugin, credential=sync_credential)
-                persisted = await self._persist_background_runtime_key(key, now, owner)
+                persisted = await self._persist_background_runtime_key_with_lock(
+                    key,
+                    now,
+                    reason="refresh_keys",
+                    expected_credential=expected_credential,
+                    expected_status=latest.status,
+                    allow_report_disabled=allow_report_disabled,
+                )
                 if persisted is None:
                     continue
                 await self._allocation_store.sync_key(persisted, self._scorer.score(persisted, now))
                 refreshed += 1
-            finally:
-                await self._repository.release_runtime_lock(key.id, owner, utcnow())
+                continue
+
+            sync_credential = await self._refresh_single_key(
+                key,
+                now,
+                plugin=plugin,
+                allow_report_disabled=allow_report_disabled,
+            )
+            if sync_credential is not None:
+                await self._sync_models(key, plugin=plugin, credential=sync_credential)
+            persisted = await self._persist_background_runtime_key_with_lock(
+                key,
+                now,
+                reason="refresh_keys",
+                expected_credential=expected_credential,
+                expected_status=latest.status,
+                allow_report_disabled=allow_report_disabled,
+            )
+            if persisted is None:
+                continue
+            await self._allocation_store.sync_key(persisted, self._scorer.score(persisted, now))
+            refreshed += 1
+        for key in keys_to_check:
+            latest = await self._repository.get_key(key.id)
+            if latest is None:
+                continue
+            if latest.status in {KeyStatus.DISABLED_ADMIN, KeyStatus.DISABLED_REPORT}:
+                continue
+            if latest.status == KeyStatus.PENDING and self._is_fresh_pending(latest, now):
+                continue
+            if self._is_active_temporary_block(latest, now):
+                continue
+            key = deepcopy(latest)
+            expected_credential = dict(latest.credential)
+
+            plugin = self._provider_registry.get(key.provider)
+            if plugin is None:
+                # 只做可用性判断，不改plugin缺失
+                continue
+            sync_credential = await self._refresh_single_key(key, now, plugin=plugin)
+            if sync_credential is not None:
+                await self._sync_models(key, plugin=plugin, credential=sync_credential)
+            persisted = await self._persist_background_runtime_key_with_lock(
+                key,
+                now,
+                reason="refresh_keys",
+                expected_credential=expected_credential,
+                expected_status=latest.status,
+            )
+            if persisted is None:
+                continue
+            await self._allocation_store.sync_key(persisted, self._scorer.score(persisted, now))
+            refreshed += 1
         return refreshed
 
     def _schedule_pending_validation(self, key_id: str) -> None:
@@ -757,53 +886,64 @@ class KeyService:
         if key is None or key.status != KeyStatus.PENDING:
             return False
 
-        owner = f"pending_validation:{uuid4()}"
-        if not await self._repository.acquire_runtime_lock(
-            key.id, owner, now, self._runtime_lock_seconds, "pending_validation"
-        ):
+        key = deepcopy(key)
+        expected_credential = dict(key.credential)
+        plugin = self._provider_registry.get(key.provider)
+        sync_credential = await self._refresh_single_key(key, now, plugin=plugin)
+        if sync_credential is not None:
+            await self._sync_models(key, plugin=plugin, credential=sync_credential)
+        persisted = await self._persist_background_runtime_key_with_lock(
+            key,
+            now,
+            reason="pending_validation",
+            expected_credential=expected_credential,
+            expected_status=KeyStatus.PENDING,
+        )
+        if persisted is None:
             return False
-        try:
-            latest = await self._repository.get_key(key.id)
-            if latest is None or latest.status != KeyStatus.PENDING:
-                return False
-            key = latest
-            plugin = self._provider_registry.get(key.provider)
-            sync_credential = await self._refresh_single_key(key, now, plugin=plugin)
-            if sync_credential is not None:
-                await self._sync_models(key, plugin=plugin, credential=sync_credential)
-            persisted = await self._persist_background_runtime_key(key, now, owner)
-            if persisted is None:
-                return False
-            await self._allocation_store.sync_key(persisted, self._scorer.score(persisted, now))
-            return True
-        finally:
-            await self._repository.release_runtime_lock(key.id, owner, utcnow())
+        await self._allocation_store.sync_key(persisted, self._scorer.score(persisted, now))
+        return True
 
     async def _refresh_single_key(
         self,
         key: ApiKey,
         now: datetime,
         plugin=None,
+        allow_report_disabled: bool = False,
     ) -> dict[str, Any] | None:
         """Refresh one key's availability/capacity cache and merge status."""
         plugin = plugin or self._provider_registry.get(key.provider)
         if plugin is None:
-            self._clear_supported_models_on_failure(key)
+            self._clear_supported_models_on_failure(
+                key,
+                allow_report_disabled=allow_report_disabled,
+            )
             key.cached_available = False
             key.cached_quota_available = None
             key.cached_capacity_score = None
             key.last_refreshed_at = now
-            self._merge_refresh_signals_into_status(key, now)
+            self._merge_refresh_signals_into_status(
+                key,
+                now,
+                allow_report_disabled=allow_report_disabled,
+            )
             return None
 
         probe_credential = await self._run_key_preflight(key, plugin)
         if probe_credential is None:
-            self._clear_supported_models_on_failure(key)
+            self._clear_supported_models_on_failure(
+                key,
+                allow_report_disabled=allow_report_disabled,
+            )
             key.cached_available = False
             key.cached_quota_available = None
             key.cached_capacity_score = None
             key.last_refreshed_at = now
-            self._merge_refresh_signals_into_status(key, now)
+            self._merge_refresh_signals_into_status(
+                key,
+                now,
+                allow_report_disabled=allow_report_disabled,
+            )
             return None
 
         try:
@@ -813,11 +953,18 @@ class KeyService:
             key.cached_available = False
 
         if key.cached_available is False:
-            self._clear_supported_models_on_failure(key)
+            self._clear_supported_models_on_failure(
+                key,
+                allow_report_disabled=allow_report_disabled,
+            )
             key.cached_quota_available = None
             key.cached_capacity_score = None
             key.last_refreshed_at = now
-            self._merge_refresh_signals_into_status(key, now)
+            self._merge_refresh_signals_into_status(
+                key,
+                now,
+                allow_report_disabled=allow_report_disabled,
+            )
             return None
 
         try:
@@ -829,7 +976,11 @@ class KeyService:
         key.cached_quota_available = None if signal is None else signal.quota_available
         key.cached_capacity_score = None if signal is None else signal.capacity_score
         key.last_refreshed_at = now
-        self._merge_refresh_signals_into_status(key, now)
+        self._merge_refresh_signals_into_status(
+            key,
+            now,
+            allow_report_disabled=allow_report_disabled,
+        )
         return probe_credential
 
     async def _prepare_registration_credential(self, credential: dict[str, Any], plugin) -> dict[str, Any]:
@@ -845,6 +996,13 @@ class KeyService:
             return None
         self._merge_runtime_mutation(latest, key)
         return latest
+
+    # async def _merge_runtime_key_for_report_disabled_persist(self, key: ApiKey) -> ApiKey | None:
+    #     latest = await self._repository.get_key(key.id)
+    #     if latest is None:
+    #         return None
+    #     self._merge_runtime_mutation(latest, key, allow_report_disabled=True)
+    #     return latest
 
     async def _persist_runtime_key(
         self,
@@ -866,7 +1024,15 @@ class KeyService:
         key: ApiKey,
         now: datetime,
         owner: str,
+        allow_report_disabled: bool = False,
     ) -> ApiKey | None:
+        if allow_report_disabled:
+            return await self._repository.update_report_disabled_runtime_snapshot_if_locked(
+                key,
+                owner,
+                now,
+            )
+
         merged = await self._merge_runtime_key_for_persist(key)
         if merged is None:
             return None
@@ -876,10 +1042,54 @@ class KeyService:
             now,
         )
 
+    async def _persist_background_runtime_key_with_lock(
+        self,
+        key: ApiKey,
+        now: datetime,
+        *,
+        reason: str,
+        expected_credential: dict[str, Any],
+        expected_status: KeyStatus,
+        allow_report_disabled: bool = False,
+    ) -> ApiKey | None:
+        owner = f"{reason}:{uuid4()}"
+        lock_now = utcnow()
+        if not await self._repository.acquire_runtime_lock(
+            key.id,
+            owner,
+            lock_now,
+            self._runtime_lock_seconds,
+            reason,
+        ):
+            return None
+        try:
+            latest = await self._repository.get_key(key.id)
+            if latest is None:
+                return None
+            if latest.status != expected_status:
+                return None
+            if not self._credential_equals(latest.credential, expected_credential):
+                return None
+            return await self._persist_background_runtime_key(
+                key,
+                now,
+                owner,
+                allow_report_disabled=allow_report_disabled,
+            )
+        finally:
+            await self._repository.release_runtime_lock(key.id, owner, utcnow())
+
     @staticmethod
-    def _merge_runtime_mutation(target: ApiKey, source: ApiKey) -> None:
+    def _merge_runtime_mutation(
+        target: ApiKey,
+        source: ApiKey,
+        allow_report_disabled: bool = False,
+    ) -> None:
         target.credential = source.credential
-        if target.status not in {KeyStatus.DISABLED_ADMIN, KeyStatus.DISABLED_REPORT}:
+        protected = {KeyStatus.DISABLED_ADMIN}
+        if not allow_report_disabled:
+            protected.add(KeyStatus.DISABLED_REPORT)
+        if target.status not in protected:
             target.status = source.status
         target.cooldown_until = source.cooldown_until
         target.supported_models = list(source.supported_models)
@@ -889,8 +1099,13 @@ class KeyService:
         target.cached_capacity_score = source.cached_capacity_score
 
     @staticmethod
-    def _clear_supported_models_on_failure(key: ApiKey) -> None:
-        if key.status in {KeyStatus.DISABLED_ADMIN, KeyStatus.DISABLED_REPORT}:
+    def _clear_supported_models_on_failure(
+        key: ApiKey,
+        allow_report_disabled: bool = False,
+    ) -> None:
+        if key.status == KeyStatus.DISABLED_ADMIN:
+            return
+        if key.status == KeyStatus.DISABLED_REPORT and not allow_report_disabled:
             return
         key.supported_models = []
 
@@ -922,8 +1137,15 @@ class KeyService:
             logger.warning("build probe credential failed for %s: %s", key.id, exc)
             return None
 
-    def _merge_refresh_signals_into_status(self, key: ApiKey, now: datetime) -> None:
-        if key.status in {KeyStatus.DISABLED_ADMIN, KeyStatus.DISABLED_REPORT}:
+    def _merge_refresh_signals_into_status(
+        self,
+        key: ApiKey,
+        now: datetime,
+        allow_report_disabled: bool = False,
+    ) -> None:
+        if key.status == KeyStatus.DISABLED_ADMIN:
+            return
+        if key.status == KeyStatus.DISABLED_REPORT and not allow_report_disabled:
             return
 
         if key.cached_available is False:
@@ -934,13 +1156,14 @@ class KeyService:
             key.status = KeyStatus.EXHAUSTED
             return
 
-        if key.status == KeyStatus.DISABLED_UPSTREAM and key.cached_available is True:
-            key.status = KeyStatus.AVAILABLE
-
-        if key.status == KeyStatus.EXHAUSTED and key.cached_quota_available is True:
-            key.status = KeyStatus.AVAILABLE
-
-        if key.status == KeyStatus.PENDING and key.cached_available is True:
+        if key.status in {
+            KeyStatus.DISABLED_REPORT,
+            KeyStatus.DISABLED_UPSTREAM,
+            KeyStatus.EXHAUSTED,
+            KeyStatus.PENDING,
+            KeyStatus.RATE_LIMITED,
+            KeyStatus.COOLDOWN,
+        } and key.cached_available is True:
             key.status = KeyStatus.AVAILABLE
 
         self._state_machine.recover_if_ready(key, now)

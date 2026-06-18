@@ -1,7 +1,7 @@
 """
 @Author: xycdaimi
 @Email: xycdaimi@gmail.com
-@Date: 2026-05-29
+@Date: 2026-06-08
 @Description: 测试用内存仓储与 Provider 假实现
 """
 from __future__ import annotations
@@ -12,6 +12,7 @@ from typing import Any
 
 from domain.entities.api_key import ApiKey
 from domain.exceptions.domain_exceptions import DuplicateCredentialError, UpstreamUnreachableError
+from domain.repositories.key_repository import AllocationLease
 from domain.value_objects.key_pool import KeyPool
 from domain.value_objects.key_status import KeyStatus
 from infrastructure.plugins.base import CapacitySignal, ProviderPlugin, ProviderRegistry
@@ -100,6 +101,34 @@ class InMemoryKeyRepository:
         key.updated_at = now
         return key
 
+    async def record_error_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+        current = self._keys.get(key.id)
+        if current is None:
+            return None
+        current.error_count = key.error_count
+        current.last_used_at = key.last_used_at
+        current.status = key.status
+        current.cooldown_until = key.cooldown_until
+        current.consecutive_error_count = key.consecutive_error_count
+        current.cooldown_failure_rounds = key.cooldown_failure_rounds
+        current.rate_limit_rounds = key.rate_limit_rounds
+        current.last_report_error_type = key.last_report_error_type
+        current.updated_at = now
+        return current
+
+    async def record_success_report_state(self, key: ApiKey, now: datetime) -> ApiKey | None:
+        current = self._keys.get(key.id)
+        if current is None:
+            return None
+        current.success_count = key.success_count
+        current.quota_used = key.quota_used
+        current.last_used_at = key.last_used_at
+        current.consecutive_error_count = key.consecutive_error_count
+        current.cooldown_failure_rounds = key.cooldown_failure_rounds
+        current.rate_limit_rounds = key.rate_limit_rounds
+        current.updated_at = now
+        return current
+
     async def update_status(
         self,
         key_id: str,
@@ -163,6 +192,25 @@ class InMemoryKeyRepository:
         if current_owner == owner:
             self._runtime_locks.pop(key_id, None)
 
+    @staticmethod
+    def _copy_runtime_fields(current: ApiKey, key: ApiKey, now: datetime) -> None:
+        current.credential = dict(key.credential)
+        current.status = key.status
+        current.cooldown_until = key.cooldown_until
+        current.supported_models = list(key.supported_models)
+        current.last_refreshed_at = key.last_refreshed_at
+        current.cached_available = key.cached_available
+        current.cached_quota_available = key.cached_quota_available
+        current.cached_capacity_score = key.cached_capacity_score
+        current.updated_at = now
+
+    @staticmethod
+    def _copy_report_fields(current: ApiKey, key: ApiKey) -> None:
+        current.consecutive_error_count = key.consecutive_error_count
+        current.cooldown_failure_rounds = key.cooldown_failure_rounds
+        current.rate_limit_rounds = key.rate_limit_rounds
+        current.last_report_error_type = key.last_report_error_type
+
     async def update_runtime_snapshot_if_locked(
         self,
         key: ApiKey,
@@ -179,15 +227,8 @@ class InMemoryKeyRepository:
         if current is None:
             return None
         self._assert_unique_provider_credential(key.id, key.provider, key.credential)
-        current.credential = dict(key.credential)
-        current.status = key.status
-        current.cooldown_until = key.cooldown_until
-        current.supported_models = list(key.supported_models)
-        current.last_refreshed_at = key.last_refreshed_at
-        current.cached_available = key.cached_available
-        current.cached_quota_available = key.cached_quota_available
-        current.cached_capacity_score = key.cached_capacity_score
-        current.updated_at = now
+        self._copy_runtime_fields(current, key, now)
+        self._copy_report_fields(current, key)
         return current
 
     async def update_background_runtime_snapshot_if_locked(
@@ -209,15 +250,26 @@ class InMemoryKeyRepository:
         }:
             return None
         self._assert_unique_provider_credential(key.id, key.provider, key.credential)
-        current.credential = dict(key.credential)
-        current.status = key.status
-        current.cooldown_until = key.cooldown_until
-        current.supported_models = list(key.supported_models)
-        current.last_refreshed_at = key.last_refreshed_at
-        current.cached_available = key.cached_available
-        current.cached_quota_available = key.cached_quota_available
-        current.cached_capacity_score = key.cached_capacity_score
-        current.updated_at = now
+        self._copy_runtime_fields(current, key, now)
+        return current
+
+    async def update_report_disabled_runtime_snapshot_if_locked(
+        self,
+        key: ApiKey,
+        owner: str,
+        now: datetime,
+    ) -> ApiKey | None:
+        current_lock = self._runtime_locks.get(key.id)
+        if current_lock is None:
+            return None
+        current_owner, lock_until, _ = current_lock
+        if current_owner != owner or lock_until <= now:
+            return None
+        current = self._keys.get(key.id)
+        if current is None or current.status != KeyStatus.DISABLED_REPORT:
+            return None
+        self._assert_unique_provider_credential(key.id, key.provider, key.credential)
+        self._copy_runtime_fields(current, key, now)
         return current
 
     async def delete_key(self, key_id: str) -> None:
@@ -242,15 +294,31 @@ class InMemoryKeyRepository:
             keys = [k for k in keys if k.provider == provider]
         return keys
 
+
+class ReleasedLeaseRecords(list):
+    def __contains__(self, item: object) -> bool:
+        if isinstance(item, tuple) and len(item) == 3:
+            return any(
+                isinstance(record, tuple) and len(record) == 4 and record[:3] == item
+                for record in self
+            )
+        return super().__contains__(item)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, list) and all(isinstance(item, tuple) and len(item) == 3 for item in other):
+            return [record[:3] for record in self] == other
+        return super().__eq__(other)
+
+
 class InMemoryAllocationStore:
     def __init__(self) -> None:
         self.synced_scores: dict[str, float] = {}
-        self.released: list[tuple[str, str, str]] = []
+        self.released: ReleasedLeaseRecords = ReleasedLeaseRecords()
         self.allocate_calls: list[tuple[str, str, list[str]]] = []
         self.any_provider_calls: list[dict[str, object]] = []
         self.any_provider_ordered_ids: list[str] = []
         self.removed_keys: set[tuple[str, str, str]] = set()
-        self.active_leases: dict[tuple[str, str, str], tuple[int, datetime]] = {}
+        self.active_leases: dict[tuple[str, str, str], dict[str, datetime] | tuple[int, datetime]] = {}
         self.max_concurrent_by_key: dict[tuple[str, str, str], int] = {}
 
     async def sync_key(self, key: ApiKey, score: float) -> None:
@@ -270,11 +338,21 @@ class InMemoryAllocationStore:
     def _prune_expired_leases(self, now: datetime) -> None:
         expired = [
             lease_key
-            for lease_key, (_, expires_at) in self.active_leases.items()
-            if expires_at <= now
+            for lease_key, leases in self.active_leases.items()
+            if self._active_count(leases, now) <= 0
         ]
         for lease_key in expired:
             self.active_leases.pop(lease_key, None)
+
+    @staticmethod
+    def _active_count(leases: dict[str, datetime] | tuple[int, datetime], now: datetime) -> int:
+        if isinstance(leases, tuple):
+            active_count, expires_at = leases
+            return 0 if expires_at <= now else active_count
+        expired = [lease_id for lease_id, expires_at in leases.items() if expires_at <= now]
+        for lease_id in expired:
+            leases.pop(lease_id, None)
+        return len(leases)
 
     async def allocate_key(
         self,
@@ -284,22 +362,25 @@ class InMemoryAllocationStore:
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         self.allocate_calls.append((provider, pool.value, list(ordered_key_ids)))
         self._prune_expired_leases(now)
         for key_id in ordered_key_ids:
             lease_key = (provider, pool.value, key_id)
             if lease_key in self.removed_keys:
                 continue
-            active_count, _ = self.active_leases.get(lease_key, (0, now))
+            leases = self.active_leases.get(lease_key, {})
+            active_count = self._active_count(leases, now)
             max_concurrent_uses = self.max_concurrent_by_key.get(lease_key, 1)
             if active_count >= max_concurrent_uses:
                 continue
-            self.active_leases[lease_key] = (
-                active_count + 1,
-                now + timedelta(seconds=max(lease_seconds, 1)),
-            )
-            return key_id
+            allocated_lease_id = lease_id or f"lease-{len(self.active_leases)}-{active_count + 1}"
+            if isinstance(leases, tuple):
+                leases = {}
+            leases[allocated_lease_id] = now + timedelta(seconds=max(lease_seconds, 1))
+            self.active_leases[lease_key] = leases
+            return AllocationLease(key_id=key_id, lease_id=allocated_lease_id)
         return None
 
     async def allocate_key_any_provider(
@@ -309,7 +390,8 @@ class InMemoryAllocationStore:
         now: datetime,
         lease_seconds: int = 2,
         allow_leased_fallback: bool = True,
-    ) -> str | None:
+        lease_id: str | None = None,
+    ) -> AllocationLease | None:
         self.any_provider_calls.append(
             {
                 "ordered_candidates": [(key.provider, key.id) for key in ordered_keys],
@@ -325,6 +407,7 @@ class InMemoryAllocationStore:
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=False,
+                lease_id=lease_id,
             )
             if allocated_id is not None:
                 return allocated_id
@@ -338,19 +421,33 @@ class InMemoryAllocationStore:
                 now,
                 lease_seconds=lease_seconds,
                 allow_leased_fallback=True,
+                lease_id=lease_id,
             )
             if allocated_id is not None:
                 return allocated_id
         return None
 
-    async def release_key_lease(self, provider: str, pool: KeyPool, key_id: str) -> None:
-        self.released.append((provider, pool.value, key_id))
+    async def release_key_lease(
+        self,
+        provider: str,
+        pool: KeyPool,
+        key_id: str,
+        lease_id: str | None = None,
+    ) -> None:
+        lease_id = lease_id or ""
+        self.released.append((provider, pool.value, key_id, lease_id))
         lease_key = (provider, pool.value, key_id)
-        active_count, expires_at = self.active_leases.get(lease_key, (0, datetime.min.replace(tzinfo=timezone.utc)))
-        if active_count <= 1:
+        leases = self.active_leases.get(lease_key)
+        if leases is None:
+            return
+        if isinstance(leases, tuple):
             self.active_leases.pop(lease_key, None)
             return
-        self.active_leases[lease_key] = (active_count - 1, expires_at)
+        if not lease_id and leases:
+            lease_id = next(iter(leases))
+        leases.pop(lease_id, None)
+        if not leases:
+            self.active_leases.pop(lease_key, None)
 
 
 class InMemoryAnyProviderAllocationStore(InMemoryAllocationStore):
